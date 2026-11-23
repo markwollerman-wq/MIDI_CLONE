@@ -1,0 +1,48 @@
+name: Build plugin
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write          # lets the build publish a Release with the plugin file
+
+jobs:
+  build:
+    runs-on: macos-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --config Release --parallel --target MidiClone_VST3
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp -R "build/MidiClone_artefacts/Release/VST3/MIDI Clone.vst3" dist/
+          codesign --force --deep -s - "dist/MIDI Clone.vst3"
+          echo "Architectures:"; lipo -archs "dist/MIDI Clone.vst3/Contents/MacOS/MIDI Clone"
+          cd dist
+          ditto -c -k --keepParent "MIDI Clone.vst3" MidiClone-VST3-mac.zip
+          rm -rf "MIDI Clone.vst3"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MidiClone-macOS
+          path: dist
+
+      # Backup delivery: the same zip as a GitHub Release (Code tab > Releases),
+      # in case artifact uploads time out like they did for Ground Shake
+      - name: Publish release
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="build-${{ github.run_number }}"
+          gh release create "$TAG" dist/MidiClone-VST3-mac.zip --repo "${{ github.repository }}" \
+            --title "MIDI Clone build ${{ github.run_number }}" \
+            --notes "Mac build (Apple Silicon + Intel). Download MidiClone-VST3-mac.zip."
