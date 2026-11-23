@@ -1,0 +1,131 @@
+#pragma once
+
+#include <juce_audio_processors/juce_audio_processors.h>
+#include <juce_gui_extra/juce_gui_extra.h>
+#include "PluginProcessor.h"
+
+namespace Pal
+{
+const juce::Colour bg       { 0xff050506 };
+const juce::Colour panel    { 0xff0d0d0f };
+const juce::Colour panelHi  { 0xff18181b };
+const juce::Colour red      { 0xffff2340 };
+const juce::Colour redSoft  { 0xffff5c70 };
+const juce::Colour redDim   { 0xff5c0d17 };
+const juce::Colour redDeep  { 0xff1c0307 };
+const juce::Colour text     { 0xfff2f2f4 };
+const juce::Colour dim      { 0xff8c8c93 };
+}
+
+class NeonLook : public juce::LookAndFeel_V4
+{
+public:
+    NeonLook();
+    void drawButtonBackground (juce::Graphics&, juce::Button&, const juce::Colour&, bool over, bool down) override;
+    void drawButtonText (juce::Graphics&, juce::TextButton&, bool over, bool down) override;
+    void drawComboBox (juce::Graphics&, int w, int h, bool down, int bx, int by, int bw, int bh, juce::ComboBox&) override;
+    void positionComboBoxText (juce::ComboBox&, juce::Label&) override;
+    juce::Font getComboBoxFont (juce::ComboBox&) override;
+    void drawRotarySlider (juce::Graphics&, int x, int y, int w, int h, float pos, float start, float end, juce::Slider&) override;
+    void drawPopupMenuBackground (juce::Graphics&, int w, int h) override;
+};
+
+// Draws notes on a bar grid. Shared by the source pane and the lanes.
+class PianoRoll : public juce::Component
+{
+public:
+    void setNotes (std::vector<mc::Note> n, double lengthBeats, int beatsPerBar, int lowPitch, int highPitch);
+    void setPlayhead (double pos01) { playhead = pos01; repaint(); }
+    void setHighlighted (bool h)    { highlighted = h; repaint(); }
+    void paint (juce::Graphics&) override;
+private:
+    std::vector<mc::Note> notes;
+    double lengthBeats = 4.0;
+    int beatsPerBar = 4, low = 36, high = 48;
+    double playhead = -1.0;
+    bool highlighted = false;
+};
+
+class IconButton : public juce::Button
+{
+public:
+    enum class Kind { play, lock };
+    IconButton (Kind k) : juce::Button (k == Kind::play ? "Preview" : "Lock"), kind (k) { setClickingTogglesState (false); }
+    void paintButton (juce::Graphics&, bool over, bool down) override;
+private:
+    Kind kind;
+};
+
+class SourcePane : public juce::Component, public juce::FileDragAndDropTarget
+{
+public:
+    explicit SourcePane (MidiCloneProcessor&);
+    void refresh();
+    void paint (juce::Graphics&) override;
+    void resized() override;
+    bool isInterestedInFileDrag (const juce::StringArray&) override;
+    void fileDragEnter (const juce::StringArray&, int, int) override { dragOver = true; repaint(); }
+    void fileDragExit (const juce::StringArray&) override              { dragOver = false; repaint(); }
+    void filesDropped (const juce::StringArray&, int, int) override;
+    std::function<void (const juce::String&)> onStatus;
+private:
+    void load (const juce::File&);
+    MidiCloneProcessor& proc;
+    juce::TextButton browse { "Browse" };
+    PianoRoll roll;
+    std::unique_ptr<juce::FileChooser> chooser;
+    bool dragOver = false;
+    juce::String summary;
+};
+
+class LaneComponent : public juce::Component
+{
+public:
+    LaneComponent (MidiCloneProcessor&, int index);
+    void setLane (const mc::Lane&, const mc::Analysis&);
+    void updateState (int requestedPreview, int activePreview, double playPos);
+    void paint (juce::Graphics&) override;
+    void resized() override;
+    void mouseDown (const juce::MouseEvent&) override;
+    void mouseDrag (const juce::MouseEvent&) override;
+    void mouseUp (const juce::MouseEvent&) override;
+private:
+    MidiCloneProcessor& proc;
+    int index;
+    PianoRoll roll;
+    IconButton preview { IconButton::Kind::play }, lock { IconButton::Kind::lock };
+    bool empty = true, dragStarted = false;
+    double overlapValue = 0.0;
+};
+
+class MidiCloneEditor : public juce::AudioProcessorEditor, private juce::Timer
+{
+public:
+    explicit MidiCloneEditor (MidiCloneProcessor&);
+    ~MidiCloneEditor() override;
+    void paint (juce::Graphics&) override;
+    void resized() override;
+private:
+    void timerCallback() override;
+    void refreshAll();
+    void setStatus (const juce::String& s, bool isError = false);
+
+    MidiCloneProcessor& proc;
+    NeonLook look;
+
+    juce::ComboBox typeBox, rhythmBox, modeBox;
+    juce::Slider slideKnob, variationKnob;
+    juce::TextButton generateButton { "GENERATE" };
+    std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> rhythmAtt, modeAtt;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> slideAtt, variationAtt;
+
+    SourcePane source;
+    std::vector<std::unique_ptr<LaneComponent>> laneComps;
+
+    juce::String status;
+    bool statusIsError = false;
+    int lastChange = -1;
+    juce::Rectangle<int> topBar, labelsRow, lanesArea, footer;
+
+    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (MidiCloneEditor)
+};
