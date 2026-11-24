@@ -36,7 +36,7 @@ juce::AudioProcessorValueTreeState::ParameterLayout MidiCloneProcessor::createLa
     using namespace juce;
     AudioProcessorValueTreeState::ParameterLayout l;
     l.add (std::make_unique<AudioParameterChoice> (ParameterID { "type", 1 }, "MIDI Type",
-                                                   StringArray { "Bass", "Melody / Lead", "Arp / Pluck", "Stab / Riff" }, 0));
+                                                   StringArray { "Bass", "Melody / Lead", "Arp / Pluck", "Stab / Riff", "Chords" }, 0));
     l.add (std::make_unique<AudioParameterChoice> (ParameterID { "rhythm", 1 }, "Rhythm",
                                                    StringArray { "Locked", "Same Feel" }, 0));
     l.add (std::make_unique<AudioParameterChoice> (ParameterID { "mode", 1 }, "Engine",
@@ -49,6 +49,8 @@ juce::AudioProcessorValueTreeState::ParameterLayout MidiCloneProcessor::createLa
     l.add (std::make_unique<AudioParameterFloat> (ParameterID { "newnotes", 1 }, "New Notes",
                                                   NormalisableRange<float> (0.0f, 30.0f, 1.0f), 0.0f,
                                                   AudioParameterFloatAttributes().withLabel ("%")));
+    l.add (std::make_unique<AudioParameterChoice> (ParameterID { "match", 1 }, "Match",
+                                                   StringArray { "Note count", "Playing time" }, 0));
     return l;
 }
 
@@ -375,19 +377,20 @@ void MidiCloneProcessor::applyTypeDefaults (mc::MidiType t)
     setParam ("type", (float) (int) t);
     setParam ("rhythm", (float) (int) mc::defaultRhythmFor (t));
     setParam ("shape", mc::defaultKeepShapeFor (t) ? 1.0f : 0.0f);
-    if (t == mc::MidiType::stab) setParam ("mode", 0.0f);   // stabs: Grid Snapped
+    if (t == mc::MidiType::stab || t == mc::MidiType::chords) setParam ("mode", 0.0f);   // stabs and chords: Grid Snapped
 }
 
 mc::Settings MidiCloneProcessor::currentSettings() const
 {
     mc::Settings s;
-    s.type        = (mc::MidiType) juce::jlimit (0, 3, (int) params.getRawParameterValue ("type")->load());
+    s.type        = (mc::MidiType) juce::jlimit (0, 4, (int) params.getRawParameterValue ("type")->load());
     s.rhythm      = (mc::RhythmMode) (int) params.getRawParameterValue ("rhythm")->load();
     s.slide       = params.getRawParameterValue ("mode")->load() > 0.5f;
     s.slideAmount = params.getRawParameterValue ("slide")->load() / 100.0f;
     s.variation   = juce::jlimit (1, 10, (int) params.getRawParameterValue ("variation")->load());
     s.keepShape   = params.getRawParameterValue ("shape")->load() > 0.5f;
     s.newNotes    = params.getRawParameterValue ("newnotes")->load() / 100.0f;
+    s.matchTime   = params.getRawParameterValue ("match")->load() > 0.5f;
     const juce::SpinLock::ScopedLockType lock (dataLock);
     s.keyRoot  = targetKey.root;
     s.keyScale = targetKey.scale;
@@ -524,6 +527,39 @@ bool MidiCloneProcessor::hasSource() const
     return analysis.valid;
 }
 
+juce::File MidiCloneProcessor::writeNotesToTempFile (const juce::String& clipName, const std::vector<mc::Note>& notes,
+                                                     double lengthBeats, int beatsPerBar) const
+{
+    if (notes.empty()) return {};
+    const int tpq = 960;
+    juce::MidiMessageSequence seq;
+    seq.addEvent (juce::MidiMessage::textMetaEvent (3, clipName), 0.0);
+    seq.addEvent (juce::MidiMessage::timeSignatureMetaEvent (beatsPerBar, 4), 0.0);
+    for (auto& n : notes)
+    {
+        if (n.start < -1e-9 || n.start >= lengthBeats) continue;
+        const double end = juce::jmin (n.start + n.length, lengthBeats - 0.001);
+        seq.addEvent (juce::MidiMessage::noteOn (1, n.pitch, (juce::uint8) n.velocity), n.start * tpq);
+        seq.addEvent (juce::MidiMessage::noteOff (1, n.pitch), end * tpq);
+    }
+    seq.updateMatchedPairs();
+    // Marks the clip's full length (so a 4-bar clip stays 4 bars even if it ends with a rest)
+    seq.addEvent (juce::MidiMessage::endOfTrack(), lengthBeats * tpq);
+
+    juce::MidiFile mf;
+    mf.setTicksPerQuarterNote (tpq);
+    mf.addTrack (seq);
+
+    auto dir = juce::File::getSpecialLocation (juce::File::tempDirectory).getChildFile ("WOLLER MIDI Clone");
+    dir.createDirectory();
+    auto file = dir.getChildFile (juce::File::createLegalFileName (clipName) + ".mid");
+    file.deleteFile();
+    juce::FileOutputStream out (file);
+    if (! out.openedOk() || ! mf.writeTo (out)) return {};
+    out.flush();
+    return file;
+}
+
 juce::File MidiCloneProcessor::writeLaneToTempFile (int laneIndex) const
 {
     mc::Lane lane;
@@ -540,35 +576,144 @@ juce::File MidiCloneProcessor::writeLaneToTempFile (int laneIndex) const
     }
     if (lane.empty) return {};
     if (base.isEmpty()) base = "MIDI";
-
-    const int tpq = 960;
     juce::String clipName = base + " Clone " + juce::String (laneIndex + 1);
     if (key.valid() && key.scale != mc::chromaticScaleIndex())
         clipName += " (" + juce::String (mc::keyName (key)) + ")";
-    juce::MidiMessageSequence seq;
-    seq.addEvent (juce::MidiMessage::textMetaEvent (3, clipName), 0.0);
-    seq.addEvent (juce::MidiMessage::timeSignatureMetaEvent (a.beatsPerBar, 4), 0.0);
-    for (auto& n : lane.notes)
+    return writeNotesToTempFile (clipName, lane.notes, a.lengthBeats, a.beatsPerBar);
+}
+
+juce::File MidiCloneProcessor::writeSourceToTempFile() const
+{
+    SourceView v;
+    juce::String base;
     {
-        seq.addEvent (juce::MidiMessage::noteOn (1, n.pitch, (juce::uint8) n.velocity), n.start * tpq);
-        seq.addEvent (juce::MidiMessage::noteOff (1, n.pitch), (n.start + n.length) * tpq);
+        const juce::SpinLock::ScopedLockType lock (dataLock);
+        if (! analysis.valid) return {};
+        v = view;
+        base = sourceName.containsChar ('.') ? sourceName.upToLastOccurrenceOf (".", false, false) : sourceName;
     }
-    seq.updateMatchedPairs();
-    // Marks the clip's full length (so a 4-bar clip stays 4 bars even if it ends with a rest)
-    seq.addEvent (juce::MidiMessage::endOfTrack(), a.lengthBeats * tpq);
+    if (base.isEmpty()) base = "MIDI";
+    juce::String tag;
+    const bool keyed = v.target.valid() && v.target.scale != mc::chromaticScaleIndex();
+    if (v.fixOn && keyed)            tag = juce::String (mc::keyName (v.target)) + " fixed";
+    else if (v.moveTo >= 0 && keyed) tag = juce::String (mc::keyName (v.target));
+    else                             tag = "original";
+    return writeNotesToTempFile (base + " (" + tag + ")", v.notes, v.lengthBeats, v.beatsPerBar);
+}
 
-    juce::MidiFile mf;
-    mf.setTicksPerQuarterNote (tpq);
-    mf.addTrack (seq);
+bool MidiCloneProcessor::moreLikeThis (int laneIndex)
+{
+    if (laneIndex < 0 || laneIndex >= mc::numLanes) return false;
+    mc::Analysis original;
+    mc::LaneSet working;
+    int bpb = 4;
+    mc::Key key;
+    {
+        const juce::SpinLock::ScopedLockType lock (dataLock);
+        if (! analysis.valid || lanes[(size_t) laneIndex].empty) return false;
+        original = analysis;
+        working = lanes;
+        bpb = analysis.beatsPerBar;
+        key = targetKey;
+    }
+    juce::ignoreUnused (bpb, key);
+    const auto before = working;
+    working[(size_t) laneIndex].locked = true;   // the chosen lane stays
+    const auto settings = currentSettings();
+    mc::varyFrom (laneIndex, settings, working, (std::uint32_t) juce::Random::getSystemRandom().nextInt());
 
-    auto dir = juce::File::getSpecialLocation (juce::File::tempDirectory).getChildFile ("WOLLER MIDI Clone");
-    dir.createDirectory();
-    auto file = dir.getChildFile (juce::File::createLegalFileName (clipName) + ".mid");
-    file.deleteFile();
-    juce::FileOutputStream out (file);
-    if (! out.openedOk() || ! mf.writeTo (out)) return {};
-    out.flush();
-    return file;
+    // "x% like source" still compares with your original clip
+    for (int i = 0; i < mc::numLanes; ++i)
+        if (i != laneIndex && ! before[(size_t) i].locked)
+            working[(size_t) i].overlapWithSource = mc::overlap (settings.type == mc::MidiType::chords ? original.polyNotes
+                                                                                                    : original.notes,
+                                                                 working[(size_t) i].notes);
+    {
+        const juce::SpinLock::ScopedLockType lock (dataLock);
+        previousLanes = before;
+        hasPrevious = true;
+        lanes = working;
+    }
+    flushNotes = true;
+    ++changeCounter;
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Presets
+
+namespace
+{
+struct FactoryPreset { const char* name; int type, rhythm, mode; float slide; int variation; bool shape; float newNotes; int match; };
+const FactoryPreset factoryPresets[] = {
+    { "Init",                  0, 0, 0, 25.0f, 5, false, 0.0f,  0 },
+    { "Bass - Tight",          0, 0, 0, 25.0f, 3, false, 0.0f,  0 },
+    { "Bass - Rolling Slide",  0, 0, 1, 35.0f, 5, false, 0.0f,  0 },
+    { "Bass - Time Balanced",  0, 0, 0, 25.0f, 5, false, 0.0f,  1 },
+    { "Rave Stab - Locked",    3, 0, 0, 25.0f, 4, true,  0.0f,  0 },
+    { "Rave Stab - Loose",     3, 1, 0, 25.0f, 7, true,  10.0f, 0 },
+    { "Melody - Close",        1, 1, 0, 25.0f, 3, true,  0.0f,  0 },
+    { "Melody - Explore",      1, 1, 0, 25.0f, 8, false, 15.0f, 0 },
+    { "Arp - Shifting",        2, 0, 0, 25.0f, 6, true,  0.0f,  0 },
+    { "Chords - Smooth",       4, 0, 0, 25.0f, 4, true,  0.0f,  0 },
+    { "Chords - New Chords",   4, 0, 0, 25.0f, 6, true,  20.0f, 0 },
+};
+constexpr int numFactory = (int) (sizeof (factoryPresets) / sizeof (factoryPresets[0]));
+const char* const presetParamIds[] = { "type", "rhythm", "mode", "slide", "variation", "shape", "newnotes", "match" };
+} // namespace
+
+juce::File MidiCloneProcessor::presetFolder()
+{
+    return juce::File::getSpecialLocation (juce::File::userApplicationDataDirectory)
+               .getChildFile ("WOLLER").getChildFile ("MIDI Clone").getChildFile ("Presets");
+}
+
+int MidiCloneProcessor::numFactoryPresets() const { return numFactory; }
+
+juce::StringArray MidiCloneProcessor::getPresetNames() const
+{
+    juce::StringArray names;
+    for (auto& p : factoryPresets) names.add (p.name);
+    auto files = presetFolder().findChildFiles (juce::File::findFiles, false, "*.xml");
+    files.sort();
+    for (auto& f : files) names.add (f.getFileNameWithoutExtension());
+    return names;
+}
+
+void MidiCloneProcessor::applyPreset (int index)
+{
+    if (index >= 0 && index < numFactory)
+    {
+        const auto& p = factoryPresets[index];
+        setParam ("type", (float) p.type);
+        setParam ("rhythm", (float) p.rhythm);
+        setParam ("mode", (float) p.mode);
+        setParam ("slide", p.slide);
+        setParam ("variation", (float) p.variation);
+        setParam ("shape", p.shape ? 1.0f : 0.0f);
+        setParam ("newnotes", p.newNotes);
+        setParam ("match", (float) p.match);
+        return;
+    }
+    const auto names = getPresetNames();
+    if (index < 0 || index >= names.size()) return;
+    auto xml = juce::XmlDocument::parse (presetFolder().getChildFile (names[index] + ".xml"));
+    if (xml == nullptr || ! xml->hasTagName ("MidiClonePreset")) return;
+    for (auto* id : presetParamIds)
+        if (xml->hasAttribute (id))
+            setParam (id, (float) xml->getDoubleAttribute (id));
+}
+
+bool MidiCloneProcessor::saveUserPreset (const juce::String& name)
+{
+    const auto clean = juce::File::createLegalFileName (name.trim());
+    if (clean.isEmpty()) return false;
+    presetFolder().createDirectory();
+    juce::XmlElement xml ("MidiClonePreset");
+    for (auto* id : presetParamIds)
+        if (auto* p = params.getParameter (id))
+            xml.setAttribute (id, (double) p->convertFrom0to1 (p->getValue()));
+    return xml.writeTo (presetFolder().getChildFile (clean + ".xml"));
 }
 
 // ---------------------------------------------------------------------------

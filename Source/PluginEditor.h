@@ -52,14 +52,14 @@ private:
 class IconButton : public juce::Button
 {
 public:
-    enum class Kind { play, lock };
-    IconButton (Kind k) : juce::Button (k == Kind::play ? "Preview" : "Lock"), kind (k) { setClickingTogglesState (false); }
+    enum class Kind { play, lock, similar };
+    IconButton (Kind k) : juce::Button (k == Kind::play ? "Preview" : (k == Kind::lock ? "Lock" : "More like this")), kind (k) { setClickingTogglesState (false); }
     void paintButton (juce::Graphics&, bool over, bool down) override;
 private:
     Kind kind;
 };
 
-class SourcePane : public juce::Component, public juce::FileDragAndDropTarget
+class SourcePane : public juce::Component, public juce::FileDragAndDropTarget, public juce::SettableTooltipClient
 {
 public:
     explicit SourcePane (MidiCloneProcessor&);
@@ -71,6 +71,9 @@ public:
     void fileDragEnter (const juce::StringArray&, int, int) override { dragOver = true; repaint(); }
     void fileDragExit (const juce::StringArray&) override              { dragOver = false; repaint(); }
     void filesDropped (const juce::StringArray&, int, int) override;
+    void mouseMove (const juce::MouseEvent&) override;
+    void mouseDown (const juce::MouseEvent&) override;
+    void mouseDrag (const juce::MouseEvent&) override;
     std::function<void (const juce::String&)> onStatus;
 private:
     void load (const juce::File&);
@@ -82,7 +85,7 @@ private:
     IconButton preview { IconButton::Kind::play };
     PianoRoll roll;
     std::unique_ptr<juce::FileChooser> chooser;
-    bool dragOver = false;
+    bool dragOver = false, dragStarted = false;
     juce::String summary, keyStatus;
     bool keyStatusWarn = false;
     int keyMenuVersion = -1;
@@ -105,7 +108,7 @@ private:
     MidiCloneProcessor& proc;
     int index;
     PianoRoll roll;
-    IconButton preview { IconButton::Kind::play }, lock { IconButton::Kind::lock };
+    IconButton preview { IconButton::Kind::play }, lock { IconButton::Kind::lock }, similar { IconButton::Kind::similar };
     bool empty = true, dragStarted = false;
     double overlapValue = 0.0;
     int newNotes = 0;
@@ -122,6 +125,8 @@ private:
     void timerCallback() override;
     void refreshAll();
     void setStatus (const juce::String& s, bool isError = false);
+    void refreshPresets();
+    void askPresetName();
 
     MidiCloneProcessor& proc;
     NeonLook look;
@@ -130,8 +135,10 @@ private:
     juce::ComboBox typeBox, rhythmBox, modeBox;
     juce::TextButton shapeButton { "KEEP SHAPE" };
     juce::Slider slideKnob, variationKnob, newNotesKnob;
-    juce::TextButton generateButton { "GENERATE" }, undoButton { "UNDO" };
-    std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> rhythmAtt, modeAtt;
+    juce::TextButton generateButton { "GENERATE" }, undoButton { "UNDO" }, savePresetButton { "SAVE" };
+    juce::ComboBox presetBox, matchBox;
+    std::unique_ptr<juce::AlertWindow> presetDialog;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> rhythmAtt, modeAtt, matchAtt;
     std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> shapeAtt;
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> slideAtt, variationAtt, newNotesAtt;
 
@@ -141,7 +148,7 @@ private:
     juce::String status;
     bool statusIsError = false;
     int lastChange = -1;
-    juce::Rectangle<int> topBar, labelsRow, lanesArea, footer;
+    juce::Rectangle<int> topBar, labelsRow, row2, lanesArea, footer;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (MidiCloneEditor)
 };

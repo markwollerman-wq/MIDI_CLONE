@@ -79,8 +79,19 @@ public:
     double getPlayPosition() const       { return playPosition.load(); }   // 0..1 inside the clip
     bool isHostPlaying() const           { return hostPlaying.load(); }
 
-    // Writes one lane to a temporary .mid file for dragging into Ableton
+    // Writes one lane / the source (fixed or original, after Move To) to a temporary .mid file for dragging into Ableton
     juce::File writeLaneToTempFile (int lane) const;
+    juce::File writeSourceToTempFile() const;
+
+    // More like this: regenerates the other unlocked lanes as variations of one lane (which gets locked)
+    bool moreLikeThis (int lane);
+
+    // Presets (factory first, then the user's own)
+    juce::StringArray getPresetNames() const;
+    int numFactoryPresets() const;
+    void applyPreset (int index);
+    bool saveUserPreset (const juce::String& name);
+    static juce::File presetFolder();
 
     std::atomic<int> changeCounter { 0 };   // editor repaints when this changes
 
@@ -91,6 +102,8 @@ private:
                       int numSamples, std::vector<std::pair<int, juce::MidiMessage>>& out);
     void allNotesOff (int sample, std::vector<std::pair<int, juce::MidiMessage>>& out);
     void setParam (const char* id, float value);
+    juce::File writeNotesToTempFile (const juce::String& clipName, const std::vector<mc::Note>& notes,
+                                     double lengthBeats, int beatsPerBar) const;
 
     mutable juce::SpinLock dataLock;   // protects everything below up to the audio-thread section
     std::vector<mc::Note> rawNotes;    // the file as loaded (sorted)

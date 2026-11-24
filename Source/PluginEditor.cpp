@@ -43,6 +43,7 @@ const char* typeName (mc::MidiType t)
         case mc::MidiType::melody: return "Melody / Lead";
         case mc::MidiType::arp:    return "Arp / Pluck";
         case mc::MidiType::stab:   return "Stab / Riff";
+        case mc::MidiType::chords: return "Chords";
     }
     return "";
 }
@@ -63,6 +64,15 @@ NeonLook::NeonLook()
     setColour (juce::TooltipWindow::backgroundColourId, Pal::panel);
     setColour (juce::TooltipWindow::textColourId, Pal::text);
     setColour (juce::TooltipWindow::outlineColourId, Pal::red);
+    setColour (juce::AlertWindow::backgroundColourId, Pal::panel);
+    setColour (juce::AlertWindow::textColourId, Pal::text);
+    setColour (juce::AlertWindow::outlineColourId, Pal::red);
+    setColour (juce::TextEditor::backgroundColourId, Pal::bg);
+    setColour (juce::TextEditor::textColourId, Pal::text);
+    setColour (juce::TextEditor::outlineColourId, Pal::redDim);
+    setColour (juce::TextEditor::focusedOutlineColourId, Pal::red);
+    setColour (juce::TextEditor::highlightColourId, Pal::redDim);
+    setColour (juce::CaretComponent::caretColourId, Pal::red);
 }
 
 void NeonLook::drawButtonBackground (juce::Graphics& g, juce::Button& b, const juce::Colour&, bool over, bool down)
@@ -268,6 +278,14 @@ void IconButton::paintButton (juce::Graphics& g, bool over, bool down)
         p.addTriangle (c.getX() + 1, c.getY(), c.getX() + 1, c.getBottom(), c.getRight(), c.getCentreY());
         g.fillPath (p);
     }
+    else if (kind == Kind::similar)
+    {
+        // two overlapping squares: "more like this"
+        auto back = c.withTrimmedRight (c.getWidth() * 0.3f).withTrimmedBottom (c.getHeight() * 0.3f);
+        auto front = c.withTrimmedLeft (c.getWidth() * 0.3f).withTrimmedTop (c.getHeight() * 0.3f);
+        g.drawRoundedRectangle (back, 1.5f, 1.5f);
+        g.fillRoundedRectangle (front, 1.5f);
+    }
     else
     {
         auto body = c.withTrimmedTop (c.getHeight() * 0.45f);
@@ -328,6 +346,7 @@ SourcePane::SourcePane (MidiCloneProcessor& p) : proc (p)
     };
 
     preview.setTooltip ("Preview the source: sends it to your synth track, like the lanes");
+    setTooltip ("Hold and drag the piano roll into Ableton to keep the source (fixed / moved if those are on)");
     preview.onClick = [this]
     {
         if (! proc.hasSource()) return;
@@ -444,18 +463,40 @@ void SourcePane::refresh()
     roll.setNotes (v.notes, v.lengthBeats, v.beatsPerBar, v.low - 1, v.high + 1, v.styles);
 
     juce::StringArray parts;
-    for (auto& s : a.shares)
-        parts.add (juce::String (mc::noteNameWithOctave (s.pitch)) + " " + percent (s.share));
+    const bool chordMode = (int) proc.params.getRawParameterValue ("type")->load() == (int) mc::MidiType::chords;
+    if (chordMode)
+        for (auto& c : a.chordShares) parts.add (juce::String (c.name) + " " + percent (c.share));
+    else
+        for (auto& s : a.shares) parts.add (juce::String (mc::noteNameWithOctave (s.pitch)) + " " + percent (s.share));
     summary = parts.joinIntoString ("   ") + "      |      " + juce::String (a.bars) + (a.bars == 1 ? " bar" : " bars")
-              + "  -  " + juce::String ((int) a.notes.size()) + " notes  -  looks like: " + typeName (a.guessedType);
+              + "  -  " + (chordMode ? juce::String ((int) a.chords.size()) + " chords" : juce::String ((int) a.notes.size()) + " notes")
+              + "  -  looks like: " + typeName (a.guessedType);
     if (v.target.valid() && v.target.scale != mc::chromaticScaleIndex())
     {
         summary += "  -  " + juce::String (mc::keyName (v.target));
         const auto same = mc::sameNotesAs (v.target);
         if (! same.empty()) summary += " (same notes as " + juce::String (same) + ")";
     }
-    if (a.hadChords) summary += "  -  chords: lowest note used";
+    if (a.hadChords && ! chordMode) summary += "  -  chords: lowest note used (try Chords)";
     repaint();
+}
+
+void SourcePane::mouseMove (const juce::MouseEvent& e)
+{
+    setMouseCursor (proc.hasSource() && roll.getBounds().contains (e.getPosition()) ? juce::MouseCursor::DraggingHandCursor
+                                                                                    : juce::MouseCursor::NormalCursor);
+}
+
+void SourcePane::mouseDown (const juce::MouseEvent&) { dragStarted = false; }
+
+void SourcePane::mouseDrag (const juce::MouseEvent& e)
+{
+    if (dragStarted || ! proc.hasSource() || e.getDistanceFromDragStart() < 6
+        || ! roll.getBounds().contains (e.getMouseDownPosition())) return;
+    dragStarted = true;
+    const auto file = proc.writeSourceToTempFile();
+    if (file.existsAsFile())
+        juce::DragAndDropContainer::performExternalDragDropOfFiles ({ file.getFullPathName() }, false, this);
 }
 
 void SourcePane::updateState (int requested, int active, double playPos)
@@ -491,7 +532,7 @@ void SourcePane::paint (juce::Graphics& g)
         g.drawText ("Drop a MIDI clip here", getLocalBounds().withTrimmedBottom (24), juce::Justification::centred);
         g.setColour (Pal::dim);
         g.setFont (font (13.0f));
-        g.drawText ("or click Browse  -  bass, melody, arp or stab", getLocalBounds().withTrimmedTop (34), juce::Justification::centred);
+        g.drawText ("or click Browse  -  bass, melody, arp, stab or chords", getLocalBounds().withTrimmedTop (34), juce::Justification::centred);
         return;
     }
 
@@ -550,7 +591,11 @@ LaneComponent::LaneComponent (MidiCloneProcessor& p, int i) : proc (p), index (i
     addAndMakeVisible (roll);
     addAndMakeVisible (preview);
     addAndMakeVisible (lock);
+    addAndMakeVisible (similar);
     roll.setInterceptsMouseClicks (false, false);
+    similar.setTooltip ("More like this: keep this lane and make the other unlocked lanes variations of it");
+    similar.setMouseCursor (juce::MouseCursor::PointingHandCursor);
+    similar.onClick = [this] { if (! empty) proc.moreLikeThis (index); };
     preview.setTooltip ("Preview: send this lane's MIDI to your synth track");
     lock.setTooltip ("Lock: keep this lane when you press Generate");
     setMouseCursor (juce::MouseCursor::DraggingHandCursor);
@@ -577,9 +622,12 @@ void LaneComponent::setLane (const mc::Lane& lane, const mc::Analysis& a)
     overlapValue = lane.overlapWithSource;
     newNotes = lane.newNoteCount;
     lock.setToggleState (lane.locked && ! empty, juce::dontSendNotification);
-    roll.setNotes (empty ? std::vector<mc::Note>() : lane.notes, a.lengthBeats, a.beatsPerBar, a.lowest - 3, a.highest + 3);
+    int lo = a.lowest, hi = a.highest;   // full range of every note (chords included)
+    for (auto& n : a.polyNotes) { lo = juce::jmin (lo, n.pitch); hi = juce::jmax (hi, n.pitch); }
+    roll.setNotes (empty ? std::vector<mc::Note>() : lane.notes, a.lengthBeats, a.beatsPerBar, lo - 3, hi + 3);
     preview.setEnabled (! empty);
     lock.setEnabled (! empty);
+    similar.setEnabled (! empty);
     repaint();
 }
 
@@ -612,7 +660,7 @@ void LaneComponent::paint (juce::Graphics& g)
     {
         g.setColour (Pal::dim);
         g.setFont (font (11.0f));
-        auto info = getLocalBounds().removeFromRight (76).removeFromBottom (30).translated (0, -3);
+        auto info = getLocalBounds().removeFromRight (110).removeFromBottom (30).translated (0, -3);
         g.drawText (juce::String (juce::roundToInt (overlapValue * 100)) + "% like source", info.removeFromTop (15), juce::Justification::centred);
         if (newNotes > 0)
         {
@@ -626,10 +674,11 @@ void LaneComponent::resized()
 {
     auto r = getLocalBounds().reduced (6);
     r.removeFromLeft (28);
-    auto right = r.removeFromRight (70);
-    auto buttons = right.withSizeKeepingCentre (70, 32).translated (0, -10);
+    auto right = r.removeFromRight (104);
+    auto buttons = right.withSizeKeepingCentre (104, 32).translated (0, -10);
     preview.setBounds (buttons.removeFromLeft (35));
-    lock.setBounds (buttons);
+    lock.setBounds (buttons.removeFromLeft (35));
+    similar.setBounds (buttons);
     roll.setBounds (r.reduced (2, 2));
 }
 
@@ -658,7 +707,7 @@ MidiCloneEditor::MidiCloneEditor (MidiCloneProcessor& p)
 {
     setLookAndFeel (&look);
 
-    typeBox.addItemList ({ "Bass", "Melody / Lead", "Arp / Pluck", "Stab / Riff" }, 1);
+    typeBox.addItemList ({ "Bass", "Melody / Lead", "Arp / Pluck", "Stab / Riff", "Chords" }, 1);
     rhythmBox.addItemList ({ "Locked", "Same Feel" }, 1);
     modeBox.addItemList ({ "Grid Snapped", "Slide" }, 1);
     for (auto* b : { &typeBox, &rhythmBox, &modeBox }) addAndMakeVisible (*b);
@@ -669,7 +718,29 @@ MidiCloneEditor::MidiCloneEditor (MidiCloneProcessor& p)
 
     // The type box is handled by hand so only a user's pick changes the rhythm default
     typeBox.setSelectedItemIndex ((int) proc.params.getRawParameterValue ("type")->load(), juce::dontSendNotification);
-    typeBox.onChange = [this] { proc.applyTypeDefaults ((mc::MidiType) juce::jmax (0, typeBox.getSelectedItemIndex())); };
+    typeBox.onChange = [this]
+    {
+        proc.applyTypeDefaults ((mc::MidiType) juce::jmax (0, typeBox.getSelectedItemIndex()));
+        source.refresh();
+    };
+
+    matchBox.addItemList ({ "Note count", "Playing time" }, 1);
+    matchBox.setTooltip ("Match the note percentages by how many notes there are, or by how long each note plays");
+    matchAtt = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment> (proc.params, "match", matchBox);
+    addAndMakeVisible (matchBox);
+
+    presetBox.setTextWhenNothingSelected ("Choose a preset");
+    presetBox.setTooltip ("Presets set the options in the top bar (not your clip or lanes)");
+    presetBox.onChange = [this]
+    {
+        const int idx = presetBox.getSelectedItemIndex();
+        if (idx >= 0) { proc.applyPreset (idx); source.refresh(); setStatus ("Preset: " + presetBox.getText()); }
+    };
+    addAndMakeVisible (presetBox);
+    savePresetButton.setTooltip ("Save the current options as your own preset");
+    savePresetButton.onClick = [this] { askPresetName(); };
+    addAndMakeVisible (savePresetButton);
+    refreshPresets();
 
     rhythmAtt = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment> (proc.params, "rhythm", rhythmBox);
     modeAtt   = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment> (proc.params, "mode", modeBox);
@@ -726,8 +797,8 @@ MidiCloneEditor::MidiCloneEditor (MidiCloneProcessor& p)
     }
 
     setResizable (true, true);
-    setResizeLimits (1060, 720, 1800, 1300);
-    setSize (1180, 820);
+    setResizeLimits (1060, 760, 1800, 1340);
+    setSize (1180, 860);
     refreshAll();
     startTimerHz (30);
 }
@@ -736,6 +807,43 @@ MidiCloneEditor::~MidiCloneEditor()
 {
     stopTimer();
     setLookAndFeel (nullptr);
+}
+
+void MidiCloneEditor::refreshPresets()
+{
+    const auto names = proc.getPresetNames();
+    presetBox.clear (juce::dontSendNotification);
+    auto* menu = presetBox.getRootMenu();
+    menu->addSectionHeader ("Factory");
+    for (int i = 0; i < names.size(); ++i)
+    {
+        if (i == proc.numFactoryPresets()) menu->addSectionHeader ("Yours");
+        presetBox.addItem (names[i], i + 1);
+    }
+}
+
+void MidiCloneEditor::askPresetName()
+{
+    presetDialog = std::make_unique<juce::AlertWindow> ("Save preset", "Name your preset", juce::MessageBoxIconType::NoIcon, this);
+    presetDialog->addTextEditor ("name", "My preset");
+    presetDialog->addButton ("Save", 1, juce::KeyPress (juce::KeyPress::returnKey));
+    presetDialog->addButton ("Cancel", 0, juce::KeyPress (juce::KeyPress::escapeKey));
+    presetDialog->enterModalState (true, juce::ModalCallbackFunction::create ([this] (int result)
+    {
+        if (result == 1 && presetDialog != nullptr)
+        {
+            const auto name = presetDialog->getTextEditorContents ("name");
+            if (proc.saveUserPreset (name))
+            {
+                refreshPresets();
+                const auto names = proc.getPresetNames();
+                presetBox.setSelectedItemIndex (names.indexOf (juce::File::createLegalFileName (name.trim())), juce::dontSendNotification);
+                setStatus ("Saved preset \"" + name + "\"");
+            }
+            else setStatus ("Couldn't save that preset name.", true);
+        }
+        presetDialog.reset();
+    }), false);
 }
 
 void MidiCloneEditor::setStatus (const juce::String& s, bool isError)
@@ -781,7 +889,7 @@ void MidiCloneEditor::paint (juce::Graphics& g)
     glowOutline (g, bar, 9.0f, Pal::red, 0.6f);
 
     // Title with a neon glow
-    auto title = topBar.reduced (16, 0).removeFromLeft (190);
+    auto title = topBar.withHeight (82).reduced (16, 0).removeFromLeft (190);
     g.setFont (font (26.0f, true));
     for (int i = 3; i >= 1; --i)
     {
@@ -804,8 +912,10 @@ void MidiCloneEditor::paint (juce::Graphics& g)
     label (modeBox, "ENGINE");
     label (slideKnob, "SLIDE");
     label (variationKnob, "VARIATION");
-    label (newNotesKnob, "NEW NOTES");
+    label (newNotesKnob, (int) proc.params.getRawParameterValue ("type")->load() == (int) mc::MidiType::chords ? "NEW CHORDS" : "NEW NOTES");
     label (shapeButton, "SHAPE");
+    g.drawText ("PRESET", row2.getX(), row2.getY(), 60, row2.getHeight(), juce::Justification::centredLeft);
+    g.drawText ("MATCH", matchBox.getX() - 52, row2.getY(), 50, row2.getHeight(), juce::Justification::centredLeft);
 
     // Footer: how-to on the left, status on the right
     g.setFont (font (12.0f));
@@ -826,9 +936,20 @@ void MidiCloneEditor::paint (juce::Graphics& g)
 void MidiCloneEditor::resized()
 {
     auto r = getLocalBounds().reduced (14);
-    topBar = r.removeFromTop (82);
+    topBar = r.removeFromTop (124);
 
     auto bar = topBar.reduced (16, 12);
+    row2 = bar.removeFromBottom (30).withTrimmedLeft (190);
+    {
+        auto rr = row2;
+        rr.removeFromLeft (60);
+        presetBox.setBounds (rr.removeFromLeft (250).withSizeKeepingCentre (250, 28));
+        rr.removeFromLeft (8);
+        savePresetButton.setBounds (rr.removeFromLeft (70).withSizeKeepingCentre (70, 28));
+        rr.removeFromLeft (70);
+        matchBox.setBounds (rr.removeFromLeft (150).withSizeKeepingCentre (150, 28));
+    }
+    bar.removeFromBottom (4);
     bar.removeFromLeft (190);
     auto right = bar.removeFromRight (230);
     undoButton.setBounds (right.removeFromRight (68).withSizeKeepingCentre (68, 34));

@@ -20,7 +20,7 @@ struct Note
 };
 
 // Order matches the MIDI Type menu (new types are added at the end so saved sets still load)
-enum class MidiType   { bass = 0, melody = 1, arp = 2, stab = 3 };
+enum class MidiType   { bass = 0, melody = 1, arp = 2, stab = 3, chords = 4 };
 enum class RhythmMode { locked = 0, sameFeel = 1 };
 
 struct Settings
@@ -34,6 +34,9 @@ struct Settings
     float newNotes      = 0.0f;    // 0..0.3, share of notes replaced by new in-key notes
     int keyRoot         = 0;       // key used for New Notes
     int keyScale        = -1;      // index into scales(), -1 = unknown (New Notes off)
+    bool matchTime      = false;   // match the percentages by playing time instead of note count
+    double maxSourceOverlap = -1.0; // how much a clone may share with the source (-1 = automatic)
+    int referenceLane   = -1;      // More like this: the lane the others are based on (no "different from" check)
 };
 
 // A note on the 16th-note step grid
@@ -48,7 +51,26 @@ struct PitchShare
 {
     int pitch   = 0;
     int count   = 0;
-    double share = 0.0;   // 0..1 of all notes
+    double share = 0.0;       // 0..1 of all notes
+    double timeShare = 0.0;   // 0..1 of all playing time
+};
+
+// A chord (or single note) starting on one step. Its identity is the set of
+// pitch classes as a 12-bit mask, so C minor in any voicing is the same chord.
+struct ChordEvent
+{
+    int step = 0, length = 1;
+    std::vector<int> pitches;   // sorted, no duplicates
+    int velocity = 100;
+    int mask = 0;
+};
+
+struct ChordShare
+{
+    int mask = 0;
+    int count = 0;
+    double share = 0.0;
+    std::string name;
 };
 
 struct Analysis
@@ -76,6 +98,18 @@ struct Analysis
     double gapBeats = 0.06;           // typical silence at the end of each note
     int velocity = 100;
 
+    // Chords (filled for every clip; used by the Chords type)
+    std::vector<Note> polyNotes;               // every note, starting at bar 1
+    std::vector<ChordEvent> chords;            // whole clip
+    std::vector<ChordEvent> chordPhrase;       // first repeating chord phrase
+    int chordPeriodBars = 1;
+    std::vector<ChordShare> chordShares;       // most common first
+    std::map<int, std::vector<int>> voicing;   // chord mask -> how the source voiced it
+    std::map<int, std::map<int, int>> chordTransitions;
+    int homeChord = 0;                         // mask of the home chord
+    double chordRatio = 0.0;                   // share of onsets with 2+ notes
+    double chordGap = 0.06;
+
     MidiType guessedType = MidiType::bass;
 };
 
@@ -97,10 +131,15 @@ Analysis analyse (std::vector<Note> notes, int beatsPerBar, int homePitchClass =
 // Regenerates every unlocked lane. Locked lanes are kept as they are.
 void generate (const Analysis& a, const Settings& s, LaneSet& lanes, std::uint32_t seed);
 
+// More like this: every unlocked lane (except ref) becomes the reference lane with a few notes or
+// chords swapped (more swaps with higher Variation). Rhythm and percentages stay the same.
+void varyFrom (int ref, const Settings& s, LaneSet& lanes, std::uint32_t seed);
+
 // Defaults each MIDI Type starts with
 RhythmMode defaultRhythmFor (MidiType t);
 bool defaultKeepShapeFor (MidiType t);
 
+std::string chordName (int mask, int bassPitchClass = -1);   // "Cm", "Ab", "Bbsus4", ...
 std::string noteName (int pitch);   // "D", "Eb", ...
 std::string noteNameWithOctave (int pitch);   // Ableton style: middle C = C3
 double overlap (const std::vector<Note>& a, const std::vector<Note>& b);

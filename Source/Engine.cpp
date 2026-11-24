@@ -92,6 +92,112 @@ std::vector<int> makeRhythm (const std::vector<int>& src, const Settings& s, Rng
     return src;
 }
 
+
+// Splits a whole-clip count of each item across the phrase repeats, so the clip keeps
+// the exact percentages even when the phrase is too short to hold them (extra items go
+// to the later repeats, like a turnaround).
+std::vector<std::map<int, int>> countsPerRepeat (const std::vector<std::pair<int, double>>& shares, int perPhrase, int repeats)
+{
+    const int total = perPhrase * repeats;
+    std::map<int, int> full;
+    {
+        std::vector<std::pair<double, int>> rem;
+        int used = 0;
+        for (auto& sh : shares)
+        {
+            const double q = sh.second * total;
+            full[sh.first] = (int) std::floor (q);
+            used += full[sh.first];
+            rem.push_back ({ q - std::floor (q), sh.first });
+        }
+        std::stable_sort (rem.begin(), rem.end(), [] (auto& x, auto& y) { return x.first > y.first; });
+        for (size_t k = 0; used < total && k < rem.size(); ++k, ++used) full[rem[k].second]++;
+    }
+    std::vector<std::map<int, int>> per ((size_t) repeats);
+    std::vector<int> need ((size_t) repeats, perPhrase);
+    std::vector<int> extras;
+    for (auto& kv : full)
+    {
+        const int base = kv.second / repeats;
+        for (int r = 0; r < repeats; ++r) { per[(size_t) r][kv.first] = base; need[(size_t) r] -= base; }
+        for (int k = 0; k < kv.second % repeats; ++k) extras.push_back (kv.first);
+    }
+    // hand out the extras starting with the last repeat
+    int r = repeats - 1;
+    for (int item : extras)
+    {
+        for (int tries = 0; tries < repeats && need[(size_t) r] <= 0; ++tries) r = (r + repeats - 1) % repeats;
+        per[(size_t) r][item]++;
+        need[(size_t) r]--;
+        r = (r + repeats - 1) % repeats;
+    }
+    return per;
+}
+
+// Match by playing time: swaps notes so each pitch gets as close as possible to its time goal
+void rebalanceTime (std::vector<int>& seq, const StepList& steps, const std::map<int, double>& goal)
+{
+    auto error = [&] (const std::vector<int>& q)
+    {
+        std::map<int, double> t;
+        for (size_t i = 0; i < q.size(); ++i) t[q[i]] += steps[i].second;
+        double e = 0.0;
+        for (auto& g : goal) e += std::abs (t[g.first] - g.second);
+        return e;
+    };
+    double cur = error (seq);
+    for (int iter = 0; iter < (int) seq.size() * 4; ++iter)
+    {
+        double bestGain = 1e-9;
+        int bestI = -1, bestP = 0;
+        for (int i = 1; i < (int) seq.size(); ++i)   // keep the first note
+            for (auto& g : goal)
+            {
+                if (g.first == seq[(size_t) i]) continue;
+                auto q = seq;
+                q[(size_t) i] = g.first;
+                const double gain = cur - error (q);
+                if (gain > bestGain) { bestGain = gain; bestI = i; bestP = g.first; }
+            }
+        if (bestI < 0) break;
+        seq[(size_t) bestI] = bestP;
+        cur -= bestGain;
+    }
+}
+
+std::vector<int> bagFromCounts (const std::map<int, int>& counts)
+{
+    std::vector<int> bag;
+    for (auto& kv : counts) for (int k = 0; k < kv.second; ++k) bag.push_back (kv.first);
+    return bag;
+}
+
+// Changes as few items as possible in seq so it has exactly the wanted counts
+// (keeps the first and last item if it can)
+void rebalance (std::vector<int>& seq, const std::map<int, int>& wanted, Rng& rng)
+{
+    std::map<int, int> have;
+    for (int x : seq) have[x]++;
+    std::vector<int> positions ((size_t) seq.size());
+    std::iota (positions.begin(), positions.end(), 0);
+    std::shuffle (positions.begin(), positions.end(), rng);
+    std::stable_partition (positions.begin(), positions.end(), [&] (int i) { return i != 0 && i != (int) seq.size() - 1; });
+    for (int i : positions)
+    {
+        const int cur = seq[(size_t) i];
+        auto wit = wanted.find (cur);
+        const int want = wit == wanted.end() ? 0 : wit->second;
+        if (have[cur] <= want) continue;
+        for (auto& w : wanted)
+            if (have[w.first] < w.second)
+            {
+                have[cur]--; have[w.first]++;
+                seq[(size_t) i] = w.first;
+                break;
+            }
+    }
+}
+
 // Note counts for a number of notes, keeping the source's percentages (largest remainder rounding)
 std::vector<int> buildBag (const Analysis& a, int numNotes)
 {
@@ -372,7 +478,10 @@ std::vector<Note> makePhraseClip (const Analysis& a, const Settings& s, Rng& rng
     const int phraseSteps = a.periodBars * a.stepsPerBar;
     const int repeats = std::max (1, a.bars / a.periodBars);
     const auto srcTokens = tokensFromSteps (a.phrase, 0, phraseSteps);
-    const auto bag = buildBag (a, countNotes (srcTokens));
+    std::vector<std::pair<int, double>> shareList;
+    for (auto& sh : a.shares) shareList.push_back ({ sh.pitch, sh.share });
+    const auto perRepeat = countsPerRepeat (shareList, countNotes (srcTokens), repeats);
+    const auto bag = bagFromCounts (perRepeat.front());
 
     std::vector<int> srcPitches;
     for (auto& st : a.phrase) srcPitches.push_back (st.pitch);
@@ -380,14 +489,46 @@ std::vector<Note> makePhraseClip (const Analysis& a, const Settings& s, Rng& rng
 
     const auto tokens = makeRhythm (srcTokens, s, rng);
     const auto steps = stepsFromTokens (tokens);
-    auto scorer = [&] (const std::vector<int>& seq) { return scoreOrder (seq, steps, a, s, contour, nullptr); };
-    auto pitches = optimise (bag, scorer, a, s, rng, chaos, false);
+    // Match by playing time: each note should get its share of the playing time, not of the note count
+    std::map<int, double> timeTarget;
+    double stepTotal = 0.0;
+    for (auto& st : steps) stepTotal += st.second;
+    for (auto& sh : a.shares) timeTarget[sh.pitch] = sh.timeShare * stepTotal;
+    const double avgLen = steps.empty() ? 1.0 : stepTotal / steps.size();
+    auto scorer = [&] (const std::vector<int>& seq)
+    {
+        double sc = scoreOrder (seq, steps, a, s, contour, nullptr);
+        if (s.matchTime)
+        {
+            std::map<int, double> t;
+            for (size_t i = 0; i < seq.size(); ++i) t[seq[i]] += steps[i].second;
+            double err = 0.0;
+            for (auto& kv : timeTarget) err += std::abs (t[kv.first] - kv.second);
+            sc -= 4.0 * err / avgLen;
+        }
+        return sc;
+    };
+    auto pitches = optimise (bag, scorer, a, s, rng, chaos, s.matchTime);
     newCount = addNewNotes (pitches, steps, a, s, rng) * repeats;
 
     std::vector<Step> all;
+    std::map<int, double> timeSoFar;
     for (int r = 0; r < repeats; ++r)
     {
         auto seq = pitches;
+        if (newCount == 0)
+        {
+            if (! s.matchTime) rebalance (seq, perRepeat[(size_t) r], rng);   // exact clip percentages
+            else
+            {
+                // playing time: aim each repeat at what the clip still needs by its end
+                std::map<int, double> goal;
+                for (auto& sh : a.shares) goal[sh.pitch] = sh.timeShare * stepTotal * (r + 1) - timeSoFar[sh.pitch];
+                rebalanceTime (seq, steps, goal);
+                for (size_t i = 0; i < seq.size(); ++i) timeSoFar[seq[i]] += steps[i].second;
+            }
+        }
+        // Last time through: swap two different notes (same counts, a little variation)
         // Last time through: swap two different notes (same counts, a little variation)
         if (repeats > 1 && r == repeats - 1 && s.type != MidiType::arp
             && uniform (rng) < s.variation / 10.0 && seq.size() > 1)
@@ -395,6 +536,7 @@ std::vector<Note> makePhraseClip (const Analysis& a, const Settings& s, Rng& rng
             for (int tries = 0; tries < 20; ++tries)
             {
                 const int i = randInt (rng, 0, (int) seq.size() - 1), j = randInt (rng, 0, (int) seq.size() - 1);
+                if (s.matchTime && steps[(size_t) i].second != steps[(size_t) j].second) continue;
                 if (seq[(size_t) i] != seq[(size_t) j]) { std::swap (seq[(size_t) i], seq[(size_t) j]); break; }
             }
         }
@@ -458,8 +600,13 @@ std::vector<Note> makeStabClip (const Analysis& a, const Settings& s, Rng& rng, 
     std::map<int, int> barStarts;
     for (auto& st : a.allSteps) if (st.step % a.stepsPerBar == 0) barStarts[st.step] = st.pitch;
 
+    // targets: note counts, or playing time (in 16ths) with Match by playing time
     std::map<int, double> target;
-    for (auto& sh : a.shares) target[sh.pitch] = sh.share * (double) expandIndex.size();
+    double expandedTime = 0.0;
+    for (auto& st : expandedSteps) expandedTime += st.second;
+    for (auto& sh : a.shares)
+        target[sh.pitch] = s.matchTime ? sh.timeShare * expandedTime : sh.share * (double) expandIndex.size();
+    const double unit = s.matchTime ? expandedTime / std::max<size_t> (1, expandIndex.size()) : 1.0;
 
     auto expand = [&] (const std::vector<int>& seq)
     {
@@ -471,21 +618,22 @@ std::vector<Note> makeStabClip (const Analysis& a, const Settings& s, Rng& rng, 
     auto scorer = [&] (const std::vector<int>& seq)
     {
         const auto e = expand (seq);
-        std::map<int, int> counts;
-        for (int p : e) counts[p]++;
+        std::map<int, double> amount;
+        for (size_t k = 0; k < e.size(); ++k) amount[e[k]] += s.matchTime ? expandedSteps[k].second : 1.0;
         double err = 0.0;
-        for (auto& t : target) err += std::abs (counts[t.first] - t.second);
-        return scoreOrder (e, expandedSteps, a, s, contour, &barStarts) - 4.0 * err;
+        for (auto& t : target) err += std::abs (amount[t.first] - t.second);
+        return scoreOrder (e, expandedSteps, a, s, contour, &barStarts) - 4.0 * err / unit;
     };
 
     auto pitches = optimise (buildBag (a, (int) templateSteps.size()), scorer, a, s, rng, chaos, true);
 
     // Keep the percentages: reject a clip that's more than one note off for any source note
     {
-        std::map<int, int> counts;
-        for (int idx : expandIndex) counts[pitches[(size_t) idx]]++;
+        std::map<int, double> amount;
+        for (size_t k = 0; k < expandIndex.size(); ++k)
+            amount[pitches[(size_t) expandIndex[k]]] += s.matchTime ? expandedSteps[k].second : 1.0;
         for (auto& t : target)
-            if (std::abs (counts[t.first] - t.second) > 1.0 + 1e-9 && chaos < 0.99) return {};
+            if (std::abs (amount[t.first] - t.second) > unit * (s.matchTime ? 2.0 : 1.0) + 1e-9 && chaos < 0.99) return {};
     }
     addNewNotes (pitches, templateSteps, a, s, rng);
 
@@ -501,12 +649,267 @@ std::vector<Note> makeStabClip (const Analysis& a, const Settings& s, Rng& rng, 
     }
     return notesFromSteps (a, s, all, rng);
 }
+
+// ================= Chords =================
+struct ChordTemplate { int rel; const char* suffix; };
+
+int maskOf (std::initializer_list<int> ivs) { int m = 0; for (int iv : ivs) m |= 1 << (iv % 12); return m; }
+int rotateMask (int mask, int by) { by = ((by % 12) + 12) % 12; return ((mask >> by) | (mask << (12 - by))) & 0xfff; }
+int popcount (int m) { int c = 0; while (m) { c += m & 1; m >>= 1; } return c; }
+
+const std::vector<ChordTemplate>& chordTemplates()
+{
+    static const std::vector<ChordTemplate> t = {
+        { maskOf ({ 0, 4, 7 }), "" },        { maskOf ({ 0, 3, 7 }), "m" },
+        { maskOf ({ 0, 3, 6 }), "dim" },     { maskOf ({ 0, 4, 8 }), "aug" },
+        { maskOf ({ 0, 2, 7 }), "sus2" },    { maskOf ({ 0, 5, 7 }), "sus4" },
+        { maskOf ({ 0, 4, 7, 10 }), "7" },   { maskOf ({ 0, 4, 7, 11 }), "maj7" },
+        { maskOf ({ 0, 3, 7, 10 }), "m7" },  { maskOf ({ 0, 3, 6, 10 }), "m7b5" },
+        { maskOf ({ 0, 4, 7, 9 }), "6" },    { maskOf ({ 0, 3, 7, 9 }), "m6" },
+        { maskOf ({ 0, 2, 4, 7 }), "add9" }, { maskOf ({ 0, 2, 3, 7 }), "madd9" },
+        { maskOf ({ 0, 7 }), "5" },
+    };
+    return t;
+}
+
+// Root of a chord: the bass note if it forms a known chord, otherwise any note that does
+int chordRoot (int mask, int bassPc, int* templateIndex = nullptr)
+{
+    std::vector<int> roots;
+    if (bassPc >= 0 && (mask >> bassPc & 1)) roots.push_back (bassPc);
+    for (int r = 0; r < 12; ++r) if ((mask >> r & 1) && r != bassPc) roots.push_back (r);
+    for (int r : roots)
+    {
+        const int rel = rotateMask (mask, r);
+        const auto& t = chordTemplates();
+        for (size_t i = 0; i < t.size(); ++i)
+            if (t[i].rel == rel) { if (templateIndex) *templateIndex = (int) i; return r; }
+    }
+    if (templateIndex) *templateIndex = -1;
+    return roots.empty() ? 0 : roots.front();
+}
+
+double chordTransitionProb (const Analysis& a, int from, int to)
+{
+    auto it = a.chordTransitions.find (from);
+    if (it == a.chordTransitions.end()) return 0.0;
+    int total = 0;
+    for (auto& kv : it->second) total += kv.second;
+    auto jt = it->second.find (to);
+    return (jt == it->second.end() || total == 0) ? 0.0 : (double) jt->second / total;
+}
+
+// Picks the inversion / octave of a chord that moves least from the previous chord
+std::vector<int> voiceChord (const std::vector<int>& base, const std::vector<int>& prev, int lo, int hi,
+                             int topDirection, Rng& rng, int variation)
+{
+    std::vector<std::vector<int>> cands;
+    const int n = (int) base.size();
+    for (int inv = 0; inv < n; ++inv)
+    {
+        auto v = base;
+        for (int j = 0; j < inv; ++j) v[(size_t) j] += 12;
+        std::sort (v.begin(), v.end());
+        for (int oct : { -12, 0, 12 })
+        {
+            auto w = v;
+            bool ok = true;
+            for (auto& p : w) { p += oct; ok = ok && p >= lo - 3 && p <= hi + 3 && p >= 0 && p <= 127; }
+            if (ok) cands.push_back (w);
+        }
+    }
+    if (cands.empty()) return base;
+    if (prev.empty())
+        return std::find (cands.begin(), cands.end(), base) != cands.end() ? base : cands.front();
+
+    double bestCost = 1e18;
+    std::vector<int> best = cands.front();
+    for (auto& w : cands)
+    {
+        double move = 0.0;
+        for (int p : w)    { int d = 99; for (int q : prev) d = std::min (d, std::abs (p - q)); move += d; }
+        for (int q : prev) { int d = 99; for (int p : w)    d = std::min (d, std::abs (p - q)); move += d; }
+        double cost = move / 2.0;
+        if (topDirection != 0 && sign (w.back() - prev.back()) != topDirection) cost += 6.0;   // Keep Shape (top note)
+        if (w != base) cost += 0.5;
+        cost += uniform (rng) * variation * 0.3;
+        if (cost < bestCost) { bestCost = cost; best = w; }
+    }
+    return best;
+}
+
+// New Chords: swap some chords for in-key triads the source doesn't use (sharing notes with the old chord)
+int addNewChords (std::vector<int>& order, const Analysis& a, const Settings& s, Rng& rng,
+                  std::map<int, std::vector<int>>& newVoicings)
+{
+    if (s.newNotes <= 0.0f || s.keyScale < 0) return 0;
+    const auto& iv = scales()[(size_t) s.keyScale].intervals;
+    const int n = (int) order.size();
+    if (iv.size() != 7 || n < 3) return 0;
+    const int wanted = (int) std::lround (s.newNotes * n);
+    if (wanted == 0) return 0;
+
+    std::set<int> used;
+    for (auto& c : a.chordShares) used.insert (c.mask);
+    struct Triad { int mask; std::array<int, 3> pcs; };
+    std::vector<Triad> triads;
+    for (int d = 0; d < 7; ++d)
+    {
+        std::array<int, 3> pcs { (s.keyRoot + iv[(size_t) d]) % 12, (s.keyRoot + iv[(size_t) ((d + 2) % 7)]) % 12,
+                                 (s.keyRoot + iv[(size_t) ((d + 4) % 7)]) % 12 };
+        const int m = (1 << pcs[0]) | (1 << pcs[1]) | (1 << pcs[2]);
+        if (! used.count (m)) triads.push_back ({ m, pcs });
+    }
+    if (triads.empty()) return 0;
+
+    std::vector<int> positions;
+    for (int i = 1; i < n - 1; ++i) positions.push_back (i);
+    std::shuffle (positions.begin(), positions.end(), rng);
+
+    int placed = 0;
+    for (int pos : positions)
+    {
+        if (placed >= wanted) break;
+        const int old = order[(size_t) pos];
+        if (! used.count (old)) continue;
+        std::vector<std::pair<const Triad*, double>> cands;
+        for (auto& t : triads)
+            if (popcount (t.mask & old) >= 1) cands.push_back ({ &t, popcount (t.mask & old) + 0.5 });
+        if (cands.empty()) continue;
+        double total = 0.0;
+        for (auto& c : cands) total += c.second;
+        double r = uniform (rng) * total;
+        const Triad* pick = cands.back().first;
+        for (auto& c : cands) { r -= c.second; if (r <= 0) { pick = c.first; break; } }
+
+        if (! newVoicings.count (pick->mask))
+        {
+            // root-position triad near the old chord, with as many notes as the old voicing
+            auto it = a.voicing.find (old);
+            const auto oldV = it != a.voicing.end() ? it->second : std::vector<int> { 60 };
+            int root = oldV.front() - 6;
+            while (((root % 12) + 12) % 12 != pick->pcs[0]) ++root;
+            std::vector<int> v { root };
+            for (int k = 1; k < 3; ++k)
+            {
+                int p = v.back() + 1;
+                while (((p % 12) + 12) % 12 != pick->pcs[(size_t) k]) ++p;
+                v.push_back (p);
+            }
+            for (size_t k = 3; k < oldV.size(); ++k) v.push_back (v[(k - 3) % 3] + 12);   // double notes for bigger voicings
+            if (oldV.size() == 2) v.pop_back();
+            std::sort (v.begin(), v.end());
+            newVoicings[pick->mask] = v;
+        }
+        order[(size_t) pos] = pick->mask;
+        ++placed;
+    }
+    return placed;
+}
+
+std::vector<Note> makeChordClip (const Analysis& a, const Settings& s, Rng& rng, double chaos, int& newCount)
+{
+    if (a.chordPhrase.empty()) return {};
+    const int phraseSteps = a.chordPeriodBars * a.stepsPerBar;
+    const int repeats = std::max (1, a.bars / a.chordPeriodBars);
+
+    std::vector<Step> src;
+    for (auto& c : a.chordPhrase) src.push_back ({ c.step, c.length, 0 });
+    const auto tokens = makeRhythm (tokensFromSteps (src, 0, phraseSteps), s, rng);
+    const auto steps = stepsFromTokens (tokens);
+    const int n = (int) steps.size();
+    if (n == 0) return {};
+
+    // chord counts for each repeat, keeping the whole clip's chord percentages
+    std::vector<std::pair<int, double>> shareList;
+    for (auto& c : a.chordShares) shareList.push_back ({ c.mask, c.share });
+    const auto perRepeat = countsPerRepeat (shareList, n, repeats);
+    const auto bag = bagFromCounts (perRepeat.front());
+
+    std::vector<int> srcTop;
+    for (auto& c : a.chordPhrase) srcTop.push_back (c.pitches.back());
+    const auto contour = contourOf (srcTop);
+    std::map<int, int> barStarts;
+    for (auto& c : a.chordPhrase) if (c.step % a.stepsPerBar == 0) barStarts[c.step] = c.mask;
+
+    auto scorer = [&] (const std::vector<int>& seq)
+    {
+        const double mw = 1.5 * (11 - s.variation) / 10.0;
+        double score = 0.0;
+        for (int i = 0; i < (int) seq.size(); ++i)
+        {
+            const int m = seq[(size_t) i];
+            if (i > 0)
+            {
+                const int prev = seq[(size_t) i - 1];
+                const double tp = chordTransitionProb (a, prev, m);
+                score += mw * tp;
+                if (m == prev && tp <= 0.0) score -= 0.6;
+            }
+            if (i == 0 && m == a.homeChord) score += 2.0;                     // start on the home chord
+            if (i == (int) seq.size() - 1 && m == a.homeChord) score += 1.5;  // and come back to it
+            auto it = barStarts.find (steps[(size_t) i].first);
+            if (it != barStarts.end() && it->second == m) score += 0.8;
+        }
+        return score;
+    };
+    auto order = optimise (bag, scorer, a, s, rng, chaos, false);
+
+    std::map<int, std::vector<int>> newVoicings;
+    const int newInPhrase = addNewChords (order, a, s, rng, newVoicings);
+    newCount = newInPhrase * repeats;
+
+    int lo = 127, hi = 0;
+    for (auto& nn : a.polyNotes) { lo = std::min (lo, nn.pitch); hi = std::max (hi, nn.pitch); }
+
+    std::vector<Note> notes;
+    std::vector<int> prevVoicing;
+    for (int r = 0; r < repeats; ++r)
+    {
+        auto seq = order;
+        if (newInPhrase == 0) rebalance (seq, perRepeat[(size_t) r], rng);   // exact clip percentages
+        if (repeats > 1 && r == repeats - 1 && uniform (rng) < s.variation / 10.0 && seq.size() > 2)
+        {
+            for (int tries = 0; tries < 20; ++tries)
+            {
+                const int i = randInt (rng, 1, (int) seq.size() - 1), j = randInt (rng, 1, (int) seq.size() - 1);
+                if (seq[(size_t) i] != seq[(size_t) j]) { std::swap (seq[(size_t) i], seq[(size_t) j]); break; }
+            }
+        }
+        for (int k = 0; k < n; ++k)
+        {
+            const int m = seq[(size_t) k];
+            auto vit = a.voicing.find (m);
+            const auto base = vit != a.voicing.end() ? vit->second : newVoicings[m];
+            const int dir = (s.keepShape && k > 0 && (size_t) (k - 1) < contour.size()) ? contour[(size_t) k - 1] : 0;
+            const auto v = voiceChord (base, prevVoicing, lo, hi, dir, rng, s.variation);
+            prevVoicing = v;
+
+            const double nominal = steps[(size_t) k].second * 0.25;
+            const double len = std::max (nominal - a.chordGap, nominal * 0.5);
+            const double start = (r * phraseSteps + steps[(size_t) k].first) * 0.25;
+            for (int p : v) notes.push_back ({ start, len, p, a.velocity });
+        }
+    }
+    return notes;
+}
+
 } // namespace
 
 std::string noteName (int pitch)
 {
     static const char* names[] = { "C", "C#", "D", "Eb", "E", "F", "F#", "G", "Ab", "A", "Bb", "B" };
     return names[((pitch % 12) + 12) % 12];
+}
+
+std::string chordName (int mask, int bassPc)
+{
+    if (mask == 0) return "-";
+    int t = -1;
+    const int root = chordRoot (mask, bassPc, &t);
+    if (popcount (mask) == 1) return noteName (root) + " (note)";
+    if (t < 0) return noteName (root) + " (cluster)";
+    return noteName (root) + chordTemplates()[(size_t) t].suffix;
 }
 
 std::string noteNameWithOctave (int pitch)
@@ -521,7 +924,7 @@ RhythmMode defaultRhythmFor (MidiType t)
 
 bool defaultKeepShapeFor (MidiType t)
 {
-    return t == MidiType::melody || t == MidiType::stab;
+    return t == MidiType::melody || t == MidiType::stab || t == MidiType::chords;
 }
 
 double overlap (const std::vector<Note>& a, const std::vector<Note>& b)
@@ -609,13 +1012,111 @@ Analysis analyse (std::vector<Note> notes, int beatsPerBar, int homePitchClass)
     for (auto& kv : timePerPitch)
         if (kv.first % 12 == homePc && kv.second > bestTime) { bestTime = kv.second; a.home = kv.first; }
 
+    double totalTime = 0.0;
+    for (auto& kv : timePerPitch) totalTime += kv.second;
     for (auto& kv : countPerPitch)
-        a.shares.push_back ({ kv.first, kv.second, (double) kv.second / raw.size() });
+        a.shares.push_back ({ kv.first, kv.second, (double) kv.second / raw.size(),
+                              totalTime > 0 ? timePerPitch[kv.first] / totalTime : 0.0 });
     std::sort (a.shares.begin(), a.shares.end(), [&] (const PitchShare& x, const PitchShare& y)
                { return x.count != y.count ? x.count > y.count : timePerPitch[x.pitch] > timePerPitch[y.pitch]; });
 
     for (size_t i = 0; i + 1 < raw.size(); ++i)
         a.transitions[raw[i].pitch][raw[i + 1].pitch]++;
+
+
+    // ---- Chords: group every note by its start step ----
+    {
+        std::map<int, std::vector<const Note*>> byStep;
+        for (auto& n : notes)
+        {
+            const int st = (int) std::lround (n.start * 4.0) - firstBar * a.stepsPerBar;
+            byStep[st].push_back (&n);
+            a.polyNotes.push_back ({ n.start - a.offsetBeats, n.length, n.pitch, n.velocity });
+        }
+        std::vector<double> chordGaps;
+        for (auto& kv : byStep)
+        {
+            ChordEvent e;
+            e.step = kv.first;
+            std::set<int> ps;
+            double maxLen = 0.0;
+            long vs = 0;
+            for (auto* n : kv.second) { ps.insert (n->pitch); maxLen = std::max (maxLen, n->length); vs += n->velocity; }
+            e.pitches.assign (ps.begin(), ps.end());
+            e.length = std::max (1, (int) std::lround (maxLen * 4.0));
+            e.velocity = (int) (vs / (long) kv.second.size());
+            for (int p : e.pitches) e.mask |= 1 << (p % 12);
+            chordGaps.push_back (maxLen);   // replaced with the gap below
+            a.chords.push_back (e);
+        }
+        for (size_t i = 0; i < a.chords.size(); ++i)
+        {
+            auto& c = a.chords[i];
+            if (i + 1 < a.chords.size()) c.length = std::max (1, std::min (c.length, a.chords[i + 1].step - c.step));
+            chordGaps[i] = c.length * 0.25 - std::min (chordGaps[i], c.length * 0.25);
+        }
+        std::sort (chordGaps.begin(), chordGaps.end());
+        const double mg = chordGaps.empty() ? 0.0 : chordGaps[chordGaps.size() / 2];
+        a.chordGap = mg <= 0.005 ? 0.02 : std::clamp (mg, 0.01, 0.25);
+
+        std::map<int, int> counts;
+        int multi = 0;
+        for (size_t i = 0; i < a.chords.size(); ++i)
+        {
+            const auto& c = a.chords[i];
+            counts[c.mask]++;
+            multi += c.pitches.size() >= 2 ? 1 : 0;
+            if (! a.voicing.count (c.mask)) a.voicing[c.mask] = c.pitches;
+            if (i + 1 < a.chords.size()) a.chordTransitions[c.mask][a.chords[i + 1].mask]++;
+        }
+        a.chordRatio = a.chords.empty() ? 0.0 : (double) multi / a.chords.size();
+        for (auto& kv : counts)
+            a.chordShares.push_back ({ kv.first, kv.second, (double) kv.second / a.chords.size(),
+                                       chordName (kv.first, a.voicing[kv.first].front() % 12) });
+        std::stable_sort (a.chordShares.begin(), a.chordShares.end(), [] (auto& x, auto& y) { return x.count > y.count; });
+
+        // home chord: the most common chord built on the home note, otherwise the most common chord
+        a.homeChord = a.chordShares.empty() ? 0 : a.chordShares.front().mask;
+        for (auto& c : a.chordShares)
+            if (chordRoot (c.mask, a.voicing[c.mask].front() % 12) == a.home % 12) { a.homeChord = c.mask; break; }
+
+        // repeating chord phrase
+        a.chordPeriodBars = a.bars;
+        for (int p = 1; p < a.bars; ++p)
+        {
+            if (a.bars % p != 0) continue;
+            auto block = [&] (int startBar)
+            {
+                std::set<int> on;
+                std::multiset<int> masks;
+                for (auto& c : a.chords)
+                    if (c.step >= startBar * a.stepsPerBar && c.step < (startBar + p) * a.stepsPerBar)
+                    { on.insert (c.step - startBar * a.stepsPerBar); masks.insert (c.mask); }
+                return std::make_pair (on, masks);
+            };
+            const auto first = block (0);
+            if (first.first.empty()) continue;
+            bool repeats = true;
+            for (int k = p; k < a.bars && repeats; k += p)
+            {
+                const auto other = block (k);
+                std::vector<int> both, either, common;
+                std::set_intersection (first.first.begin(), first.first.end(), other.first.begin(), other.first.end(), std::back_inserter (both));
+                std::set_union (first.first.begin(), first.first.end(), other.first.begin(), other.first.end(), std::back_inserter (either));
+                std::set_intersection (first.second.begin(), first.second.end(), other.second.begin(), other.second.end(), std::back_inserter (common));
+                repeats = ! either.empty() && (double) both.size() / either.size() >= 0.75
+                          && (double) common.size() / std::max (first.second.size(), other.second.size()) >= 0.6;
+            }
+            if (repeats) { a.chordPeriodBars = p; break; }
+        }
+        for (auto& c : a.chords)
+            if (c.step < a.chordPeriodBars * a.stepsPerBar)
+            {
+                auto e = c;
+                e.length = std::min (e.length, a.chordPeriodBars * a.stepsPerBar - e.step);
+                a.chordPhrase.push_back (e);
+            }
+    }
 
     // Bars with identical notes and rhythm (used by Stab / Riff to keep motifs)
     {
@@ -697,7 +1198,8 @@ Analysis analyse (std::vector<Note> notes, int beatsPerBar, int homePitchClass)
     const bool barsRepeat = (int) groups.size() < a.bars;
     const bool stabby = (a.highest - a.lowest) <= 7 && shortNotes >= 0.7 * raw.size() && (barsRepeat || a.bars == 1);
 
-    if (meanPitch < 52.0)                a.guessedType = MidiType::bass;     // below E2 (Ableton E1-ish)
+    if (a.chordRatio >= 0.5)             a.guessedType = MidiType::chords;   // mostly 2+ notes at once
+    else if (meanPitch < 52.0)           a.guessedType = MidiType::bass;     // below E2 (Ableton E1-ish)
     else if (allShort && fill >= 0.6)    a.guessedType = MidiType::arp;
     else if (stabby)                     a.guessedType = MidiType::stab;
     else                                 a.guessedType = MidiType::melody;
@@ -706,13 +1208,78 @@ Analysis analyse (std::vector<Note> notes, int beatsPerBar, int homePitchClass)
     return a;
 }
 
+void varyFrom (int ref, const Settings& s, LaneSet& lanes, std::uint32_t seed)
+{
+    if (ref < 0 || ref >= numLanes || lanes[(size_t) ref].empty) return;
+    Rng rng (seed);
+
+    // the reference lane as events: notes starting together move together (chords stay whole)
+    std::map<long, std::vector<Note>> byStep;
+    for (auto& n : lanes[(size_t) ref].notes) byStep[std::lround (n.start * 4.0)].push_back (n);
+    std::vector<std::vector<Note>> events;
+    for (auto& kv : byStep) events.push_back (kv.second);
+    const int n = (int) events.size();
+    if (n < 2) return;
+
+    auto content = [] (const std::vector<Note>& e)
+    {
+        std::vector<int> ps;
+        for (auto& x : e) ps.push_back (x.pitch);
+        std::sort (ps.begin(), ps.end());
+        return ps;
+    };
+    const int swaps = std::max (1, (int) std::lround (n * (0.04 + 0.02 * s.variation)));
+
+    for (int li = 0; li < numLanes; ++li)
+    {
+        if (li == ref || (lanes[(size_t) li].locked && ! lanes[(size_t) li].empty)) continue;
+        std::vector<Note> best;
+        for (int attempt = 0; attempt < 200; ++attempt)
+        {
+            auto ev = events;
+            int done = 0;
+            for (int tries = 0; tries < 50 * swaps && done < swaps; ++tries)
+            {
+                const int i = randInt (rng, 0, n - 1), j = randInt (rng, 0, n - 1);
+                if (content (ev[(size_t) i]) == content (ev[(size_t) j])) continue;
+                if (s.keepShape && i > 0 && j > 0 && std::abs (i - j) == 1) continue;   // don't flip a step's direction
+                // swap the notes, keep each position's timing and lengths
+                auto pi = content (ev[(size_t) i]), pj = content (ev[(size_t) j]);
+                auto assign = [] (std::vector<Note>& e, const std::vector<int>& ps)
+                {
+                    const auto proto = e.front();
+                    e.clear();
+                    for (int p : ps) { auto x = proto; x.pitch = p; e.push_back (x); }
+                };
+                assign (ev[(size_t) i], pj);
+                assign (ev[(size_t) j], pi);
+                ++done;
+            }
+            std::vector<Note> notes;
+            for (auto& e : ev) for (auto& x : e) notes.push_back (x);
+
+            bool unique = overlap (lanes[(size_t) ref].notes, notes) < 0.999;
+            for (int other = 0; other < li && unique; ++other)
+                if (other != ref && ! lanes[(size_t) other].empty) unique = overlap (lanes[(size_t) other].notes, notes) < 0.999;
+            for (int other = li + 1; other < numLanes && unique; ++other)
+                if (lanes[(size_t) other].locked && ! lanes[(size_t) other].empty) unique = overlap (lanes[(size_t) other].notes, notes) < 0.999;
+            best = notes;
+            if (unique) break;
+        }
+        lanes[(size_t) li].notes = best;
+        lanes[(size_t) li].newNoteCount = lanes[(size_t) ref].newNoteCount;
+        lanes[(size_t) li].empty = best.empty();
+    }
+}
+
 void generate (const Analysis& a, const Settings& s, LaneSet& lanes, std::uint32_t seed)
 {
     if (! a.valid) return;
     Rng rng (seed);
 
     // Keep Shape follows the source closely, so it's allowed to share a few more notes with it
-    const double baseLimit = (s.rhythm == RhythmMode::locked ? 0.5 : 0.35) + (s.keepShape ? 0.1 : 0.0);
+    const double baseLimit = s.maxSourceOverlap >= 0.0 ? s.maxSourceOverlap
+                           : (s.rhythm == RhythmMode::locked ? 0.5 : 0.35) + (s.keepShape ? 0.1 : 0.0);
     const LaneSet previous = lanes;   // the batch before this Generate: don't hand those back again
 
     for (int li = 0; li < numLanes; ++li)
@@ -728,15 +1295,16 @@ void generate (const Analysis& a, const Settings& s, LaneSet& lanes, std::uint32
         {
             const double chaos = std::clamp ((attempt - 40) / 160.0, 0.0, 1.0);
             int newCount = 0;
-            auto notes = s.type == MidiType::stab ? makeStabClip (a, s, rng, chaos, newCount)
-                                                  : makePhraseClip (a, s, rng, chaos, newCount);
+            auto notes = s.type == MidiType::stab   ? makeStabClip (a, s, rng, chaos, newCount)
+                       : s.type == MidiType::chords ? makeChordClip (a, s, rng, chaos, newCount)
+                                                    : makePhraseClip (a, s, rng, chaos, newCount);
             if (notes.empty()) continue;
 
-            const double ovSrc = overlap (a.notes, notes);
+            const double ovSrc = overlap (s.type == MidiType::chords ? a.polyNotes : a.notes, notes);
             double ovLanes = 0.0;
             for (int other = 0; other < numLanes; ++other)
             {
-                if (other == li) continue;
+                if (other == li || other == s.referenceLane) continue;
                 const auto& o = lanes[(size_t) other];
                 // compare with lanes already made this round, and with locked lanes
                 if (o.empty || (other > li && ! o.locked)) continue;
