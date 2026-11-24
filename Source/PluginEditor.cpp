@@ -42,6 +42,7 @@ const char* typeName (mc::MidiType t)
         case mc::MidiType::bass:   return "Bass";
         case mc::MidiType::melody: return "Melody / Lead";
         case mc::MidiType::arp:    return "Arp / Pluck";
+        case mc::MidiType::stab:   return "Stab / Riff";
     }
     return "";
 }
@@ -77,6 +78,12 @@ void NeonLook::drawButtonBackground (juce::Graphics& g, juce::Button& b, const j
         g.setColour (juce::Colours::white.withAlpha (0.18f));
         g.fillRoundedRectangle (r.withHeight (r.getHeight() * 0.45f).reduced (2.0f, 1.5f), 5.0f);
     }
+    else if (b.getClickingTogglesState() && b.getToggleState())
+    {
+        glowOutline (g, r, 5.0f, Pal::red, over ? 1.4f : 1.0f);
+        g.setColour (Pal::redDim);
+        g.fillRoundedRectangle (r, 5.0f);
+    }
     else
     {
         glossPanel (g, r, 5.0f);
@@ -88,8 +95,9 @@ void NeonLook::drawButtonBackground (juce::Graphics& g, juce::Button& b, const j
 void NeonLook::drawButtonText (juce::Graphics& g, juce::TextButton& b, bool, bool)
 {
     const bool primary = b.getComponentID() == "generate";
-    g.setColour (primary ? juce::Colour (0xff120205) : Pal::redSoft);
-    g.setFont (font (primary ? 17.0f : 13.0f, true));
+    const bool lit = b.getClickingTogglesState() && b.getToggleState();
+    g.setColour (primary ? juce::Colour (0xff120205) : (lit ? Pal::text : (b.isEnabled() ? Pal::redSoft : Pal::dim)));
+    g.setFont (font (primary ? 17.0f : 12.5f, true));
     g.drawText (b.getButtonText(), b.getLocalBounds(), juce::Justification::centred);
 }
 
@@ -152,9 +160,10 @@ void NeonLook::drawPopupMenuBackground (juce::Graphics& g, int w, int h)
 }
 
 // ===========================================================================
-void PianoRoll::setNotes (std::vector<mc::Note> n, double len, int bpb, int lowPitch, int highPitch)
+void PianoRoll::setNotes (std::vector<mc::Note> n, double len, int bpb, int lowPitch, int highPitch, std::vector<int> st)
 {
     notes = std::move (n);
+    styles = std::move (st);
     lengthBeats = juce::jmax (1.0, len);
     beatsPerBar = juce::jmax (1, bpb);
     low = lowPitch;
@@ -183,18 +192,36 @@ void PianoRoll::paint (juce::Graphics& g)
     const float rowH = inner / (float) rows;
     const float noteH = juce::jlimit (3.0f, 9.0f, rowH * 0.8f);
 
-    for (auto& n : notes)
+    for (size_t i = 0; i < notes.size(); ++i)
     {
+        const auto& n = notes[i];
+        const int style = i < styles.size() ? styles[i] : 0;
         const float x = b.getX() + (float) (n.start / lengthBeats) * b.getWidth();
         const float w = juce::jmax (2.0f, (float) (n.length / lengthBeats) * b.getWidth() - 1.0f);
         const float yCentre = b.getBottom() - 4.0f - ((float) (n.pitch - low) + 0.5f) * rowH;
         juce::Rectangle<float> r (x, yCentre - noteH / 2, w, noteH);
+        if (style == 1)
+        {
+            // out of key: hollow white note
+            g.setColour (juce::Colours::white.withAlpha (0.15f));
+            g.fillRoundedRectangle (r.expanded (1.8f), 3.0f);
+            g.setColour (juce::Colours::white);
+            g.drawRoundedRectangle (r, 1.5f, 1.4f);
+            continue;
+        }
         g.setColour (Pal::red.withAlpha (0.22f));
         g.fillRoundedRectangle (r.expanded (1.8f), 3.0f);
         g.setColour (Pal::red);
         g.fillRoundedRectangle (r, 1.5f);
         g.setColour (juce::Colours::white.withAlpha (0.25f));
         g.fillRect (r.withHeight (1.0f).reduced (1.0f, 0.0f));
+        if (style >= 2)
+        {
+            // moved by Fix Key: white outline (and a dot when it now repeats a neighbour)
+            g.setColour (juce::Colours::white);
+            g.drawRoundedRectangle (r.expanded (1.0f), 2.0f, 1.2f);
+            if (style == 3) g.fillEllipse (r.getCentreX() - 2.0f, r.getY() - 7.0f, 4.0f, 4.0f);
+        }
     }
 
     if (playhead >= 0.0)
@@ -262,9 +289,10 @@ void IconButton::paintButton (juce::Graphics& g, bool over, bool down)
 // ===========================================================================
 SourcePane::SourcePane (MidiCloneProcessor& p) : proc (p)
 {
-    addAndMakeVisible (browse);
-    addAndMakeVisible (roll);
+    for (auto* c : std::initializer_list<juce::Component*> { &browse, &roll, &keyBox, &moveBox, &fixButton, &preview })
+        addAndMakeVisible (c);
     roll.setInterceptsMouseClicks (false, false);
+
     browse.onClick = [this]
     {
         chooser = std::make_unique<juce::FileChooser> ("Choose a MIDI clip",
@@ -275,6 +303,35 @@ SourcePane::SourcePane (MidiCloneProcessor& p) : proc (p)
                                   auto f = fc.getResult();
                                   if (f.existsAsFile()) load (f);
                               });
+    };
+
+    fixButton.setClickingTogglesState (true);
+    fixButton.setTooltip ("Fix Key: moves out-of-key notes into the key (the way the line was heading). The clones are built from the fixed version; your file isn't changed.");
+    fixButton.onClick = [this] { proc.setFix (fixButton.getToggleState()); };
+
+    keyBox.setTooltip ("Key: the best match is picked for you. Choose another to see what it would change.");
+    keyBox.onChange = [this]
+    {
+        const int id = keyBox.getSelectedId();
+        if (id == 20000) proc.setAutoKey();
+        else if (id >= 10000 && id - 10000 < (int) bestKeys.size()) proc.setKey (bestKeys[(size_t) (id - 10000)]);
+        else if (id > 0 && id < 10000) proc.setKey ({ (id - 1) / 64, (id - 1) % 64 });
+    };
+
+    moveBox.addItem ("Same key", 100);
+    for (int r = 0; r < 12; ++r) moveBox.addItem ("Move to " + juce::String (mc::noteName (r)), r + 1);
+    moveBox.setTooltip ("Move To: shifts the source (and the clones) to a new home note, same scale.");
+    moveBox.onChange = [this]
+    {
+        const int id = moveBox.getSelectedId();
+        proc.setMoveTo (id >= 1 && id <= 12 ? id - 1 : -1);
+    };
+
+    preview.setTooltip ("Preview the source: sends it to your synth track, like the lanes");
+    preview.onClick = [this]
+    {
+        if (! proc.hasSource()) return;
+        proc.setPreview (proc.getRequestedPreview() == MidiCloneProcessor::sourcePreview ? -1 : MidiCloneProcessor::sourcePreview);
     };
 }
 
@@ -305,26 +362,108 @@ void SourcePane::load (const juce::File& f)
     refresh();
 }
 
+void SourcePane::rebuildKeyMenu()
+{
+    const auto report = proc.getKeyReport();
+    const auto v = proc.getSourceView();
+    keyBox.clear (juce::dontSendNotification);
+    bestKeys.clear();
+
+    auto* menu = keyBox.getRootMenu();
+    const auto autoKey = report.ranked.empty() ? mc::Key {} : report.ranked.front().key;
+    keyBox.addItem ("Auto: " + juce::String (mc::keyName (autoKey)), 20000);
+    menu->addSectionHeader ("Best matches");
+    for (size_t i = 0; i < report.ranked.size() && i < 6; ++i)
+    {
+        const auto& c = report.ranked[i];
+        bestKeys.push_back (c.key);
+        keyBox.addItem (juce::String (mc::keyName (c.key)) + "   -   "
+                        + (c.offKey == 0 ? juce::String ("fits every note") : juce::String (c.offKey) + (c.offKey == 1 ? " change" : " changes")),
+                        10000 + (int) i);
+    }
+    menu->addSectionHeader ("All keys");
+    for (int r = 0; r < 12; ++r)
+    {
+        juce::PopupMenu sub;
+        for (int sc = 0; sc < (int) mc::scales().size(); ++sc)
+            sub.addItem (1 + r * 64 + sc, mc::keyName ({ r, sc }));
+        menu->addSubMenu (mc::noteName (r), sub);
+    }
+    keyMenuVersion = proc.keyListVersion();
+    juce::ignoreUnused (v);
+}
+
+void SourcePane::syncKeyControls()
+{
+    const auto v = proc.getSourceView();
+    int id = 20000;
+    if (! v.keyAuto)
+    {
+        id = 1 + v.key.root * 64 + v.key.scale;
+        for (size_t i = 0; i < bestKeys.size(); ++i)
+            if (bestKeys[i].root == v.key.root && bestKeys[i].scale == v.key.scale) id = 10000 + (int) i;
+    }
+    if (keyBox.getSelectedId() != id) keyBox.setSelectedId (id, juce::dontSendNotification);
+    if (id < 10000 && ! v.keyAuto) keyBox.setText (mc::keyName (v.key), juce::dontSendNotification);
+
+    const int moveId = v.moveTo >= 0 ? v.moveTo + 1 : 100;
+    if (moveBox.getSelectedId() != moveId) moveBox.setSelectedId (moveId, juce::dontSendNotification);
+    fixButton.setToggleState (v.fixOn, juce::dontSendNotification);
+    fixButton.setButtonText (v.fixOn ? "FIXED" : "FIX KEY");
+
+    if (v.key.scale == mc::chromaticScaleIndex())
+        keyStatus = "Chromatic: every note counts as in key", keyStatusWarn = false;
+    else if (v.offKey == 0)
+        keyStatus = "All " + juce::String (v.total) + " notes are in key", keyStatusWarn = false;
+    else if (v.fixOn)
+    {
+        keyStatus = juce::String (v.offKey) + (v.offKey == 1 ? " note moved" : " notes moved") + " into " + mc::keyName (v.key);
+        if (v.repeats > 0) keyStatus += "  (" + juce::String (v.repeats) + (v.repeats == 1 ? " now repeats a neighbour: dot)" : " now repeat a neighbour: dots)");
+        keyStatusWarn = false;
+    }
+    else
+        keyStatus = "! " + juce::String (v.offKey) + " of " + juce::String (v.total) + " notes out of key (white)", keyStatusWarn = true;
+}
+
 void SourcePane::refresh()
 {
     const auto a = proc.getAnalysis();
-    if (! a.valid)
+    const bool has = a.valid;
+    for (auto* c : std::initializer_list<juce::Component*> { &roll, &keyBox, &moveBox, &fixButton, &preview })
+        c->setVisible (has);
+    if (! has)
     {
-        roll.setVisible (false);
         summary.clear();
         repaint();
         return;
     }
-    roll.setVisible (true);
-    roll.setNotes (a.notes, a.lengthBeats, a.beatsPerBar, a.lowest - 1, a.highest + 1);
+    if (keyMenuVersion != proc.keyListVersion()) rebuildKeyMenu();
+    syncKeyControls();
+
+    const auto v = proc.getSourceView();
+    roll.setNotes (v.notes, v.lengthBeats, v.beatsPerBar, v.low - 1, v.high + 1, v.styles);
 
     juce::StringArray parts;
     for (auto& s : a.shares)
         parts.add (juce::String (mc::noteNameWithOctave (s.pitch)) + " " + percent (s.share));
     summary = parts.joinIntoString ("   ") + "      |      " + juce::String (a.bars) + (a.bars == 1 ? " bar" : " bars")
               + "  -  " + juce::String ((int) a.notes.size()) + " notes  -  looks like: " + typeName (a.guessedType);
+    if (v.target.valid() && v.target.scale != mc::chromaticScaleIndex())
+    {
+        summary += "  -  " + juce::String (mc::keyName (v.target));
+        const auto same = mc::sameNotesAs (v.target);
+        if (! same.empty()) summary += " (same notes as " + juce::String (same) + ")";
+    }
     if (a.hadChords) summary += "  -  chords: lowest note used";
     repaint();
+}
+
+void SourcePane::updateState (int requested, int active, double playPos)
+{
+    const bool on = requested == MidiCloneProcessor::sourcePreview;
+    preview.setToggleState (on, juce::dontSendNotification);
+    roll.setHighlighted (on);
+    roll.setPlayhead (active == MidiCloneProcessor::sourcePreview ? playPos : -1.0);
 }
 
 void SourcePane::paint (juce::Graphics& g)
@@ -352,16 +491,25 @@ void SourcePane::paint (juce::Graphics& g)
         g.drawText ("Drop a MIDI clip here", getLocalBounds().withTrimmedBottom (24), juce::Justification::centred);
         g.setColour (Pal::dim);
         g.setFont (font (13.0f));
-        g.drawText ("or click Browse  -  bass, melody or arp", getLocalBounds().withTrimmedTop (34), juce::Justification::centred);
+        g.drawText ("or click Browse  -  bass, melody, arp or stab", getLocalBounds().withTrimmedTop (34), juce::Justification::centred);
         return;
     }
 
-    auto top = getLocalBounds().reduced (14, 8).removeFromTop (22);
+    auto top = getLocalBounds().reduced (14, 8).removeFromTop (24);
     g.setColour (Pal::red);
     g.setFont (font (14.0f, true));
     g.drawText ("SOURCE", top.removeFromLeft (70), juce::Justification::centredLeft);
     g.setColour (Pal::text);
-    g.drawText (proc.getSourceName(), top.withTrimmedRight (100), juce::Justification::centredLeft);
+    g.drawText (proc.getSourceName(), top.withTrimmedRight (150), juce::Justification::centredLeft);
+
+    // key row: label and status text
+    g.setFont (font (11.0f, true));
+    g.setColour (Pal::dim);
+    g.drawText ("KEY", keyRow.withWidth (34), juce::Justification::centredLeft);
+    auto status = keyRow.withLeft (fixButton.getRight() + 12).withRight (moveBox.getX() - 12);
+    g.setFont (font (13.0f, keyStatusWarn));
+    g.setColour (keyStatusWarn ? Pal::redSoft : Pal::dim);
+    g.drawText (keyStatus, status, juce::Justification::centredLeft);
 
     g.setColour (Pal::dim);
     g.setFont (font (13.0f));
@@ -372,10 +520,26 @@ void SourcePane::resized()
 {
     auto r = getLocalBounds().reduced (14, 8);
     if (proc.hasSource())
-        browse.setBounds (r.getRight() - 92, r.getY(), 92, 24);
+    {
+        auto top = r.removeFromTop (24);
+        browse.setBounds (top.removeFromRight (92));
+        top.removeFromRight (8);
+        preview.setBounds (top.removeFromRight (30).withSizeKeepingCentre (30, 28));
+        r.removeFromTop (6);
+        keyRow = r.removeFromTop (28);
+        auto row = keyRow;
+        row.removeFromLeft (36);
+        keyBox.setBounds (row.removeFromLeft (250));
+        row.removeFromLeft (8);
+        fixButton.setBounds (row.removeFromLeft (96));
+        moveBox.setBounds (row.removeFromRight (130));
+        r.removeFromTop (6);
+    }
     else
+    {
         browse.setBounds (getWidth() / 2 - 50, getHeight() / 2 + 32, 100, 28);
-    r.removeFromTop (28);
+        r.removeFromTop (60);
+    }
     r.removeFromBottom (22);
     roll.setBounds (r);
 }
@@ -411,8 +575,9 @@ void LaneComponent::setLane (const mc::Lane& lane, const mc::Analysis& a)
 {
     empty = lane.empty || ! a.valid;
     overlapValue = lane.overlapWithSource;
+    newNotes = lane.newNoteCount;
     lock.setToggleState (lane.locked && ! empty, juce::dontSendNotification);
-    roll.setNotes (empty ? std::vector<mc::Note>() : lane.notes, a.lengthBeats, a.beatsPerBar, a.lowest - 1, a.highest + 1);
+    roll.setNotes (empty ? std::vector<mc::Note>() : lane.notes, a.lengthBeats, a.beatsPerBar, a.lowest - 3, a.highest + 3);
     preview.setEnabled (! empty);
     lock.setEnabled (! empty);
     repaint();
@@ -447,8 +612,13 @@ void LaneComponent::paint (juce::Graphics& g)
     {
         g.setColour (Pal::dim);
         g.setFont (font (11.0f));
-        auto info = getLocalBounds().removeFromRight (76).removeFromBottom (20).translated (0, -4);
-        g.drawText (juce::String (juce::roundToInt (overlapValue * 100)) + "% like source", info, juce::Justification::centred);
+        auto info = getLocalBounds().removeFromRight (76).removeFromBottom (30).translated (0, -3);
+        g.drawText (juce::String (juce::roundToInt (overlapValue * 100)) + "% like source", info.removeFromTop (15), juce::Justification::centred);
+        if (newNotes > 0)
+        {
+            g.setColour (Pal::redSoft);
+            g.drawText ("+" + juce::String (newNotes) + " new", info, juce::Justification::centred);
+        }
     }
 }
 
@@ -457,7 +627,7 @@ void LaneComponent::resized()
     auto r = getLocalBounds().reduced (6);
     r.removeFromLeft (28);
     auto right = r.removeFromRight (70);
-    auto buttons = right.withSizeKeepingCentre (70, 32).translated (0, -8);
+    auto buttons = right.withSizeKeepingCentre (70, 32).translated (0, -10);
     preview.setBounds (buttons.removeFromLeft (35));
     lock.setBounds (buttons);
     roll.setBounds (r.reduced (2, 2));
@@ -488,7 +658,7 @@ MidiCloneEditor::MidiCloneEditor (MidiCloneProcessor& p)
 {
     setLookAndFeel (&look);
 
-    typeBox.addItemList ({ "Bass", "Melody / Lead", "Arp / Pluck" }, 1);
+    typeBox.addItemList ({ "Bass", "Melody / Lead", "Arp / Pluck", "Stab / Riff" }, 1);
     rhythmBox.addItemList ({ "Locked", "Same Feel" }, 1);
     modeBox.addItemList ({ "Grid Snapped", "Slide" }, 1);
     for (auto* b : { &typeBox, &rhythmBox, &modeBox }) addAndMakeVisible (*b);
@@ -499,19 +669,17 @@ MidiCloneEditor::MidiCloneEditor (MidiCloneProcessor& p)
 
     // The type box is handled by hand so only a user's pick changes the rhythm default
     typeBox.setSelectedItemIndex ((int) proc.params.getRawParameterValue ("type")->load(), juce::dontSendNotification);
-    typeBox.onChange = [this]
-    {
-        const int idx = typeBox.getSelectedItemIndex();
-        if (auto* prm = proc.params.getParameter ("type"))
-            prm->setValueNotifyingHost (prm->convertTo0to1 ((float) idx));
-        if (auto* prm = proc.params.getParameter ("rhythm"))
-            prm->setValueNotifyingHost (prm->convertTo0to1 ((float) (int) mc::defaultRhythmFor ((mc::MidiType) idx)));
-    };
+    typeBox.onChange = [this] { proc.applyTypeDefaults ((mc::MidiType) juce::jmax (0, typeBox.getSelectedItemIndex())); };
 
     rhythmAtt = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment> (proc.params, "rhythm", rhythmBox);
     modeAtt   = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment> (proc.params, "mode", modeBox);
 
-    for (auto* s : { &slideKnob, &variationKnob })
+    shapeButton.setClickingTogglesState (true);
+    shapeButton.setTooltip ("Keep Shape: clones go up where your clip goes up and down where it goes down");
+    shapeAtt = std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment> (proc.params, "shape", shapeButton);
+    addAndMakeVisible (shapeButton);
+
+    for (auto* s : { &slideKnob, &variationKnob, &newNotesKnob })
     {
         s->setSliderStyle (juce::Slider::RotaryHorizontalVerticalDrag);
         s->setColour (juce::Slider::textBoxOutlineColourId, juce::Colours::transparentBlack);
@@ -526,6 +694,17 @@ MidiCloneEditor::MidiCloneEditor (MidiCloneProcessor& p)
     slideAtt     = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (proc.params, "slide", slideKnob);
     variationAtt = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (proc.params, "variation", variationKnob);
     slideKnob.setTextValueSuffix ("%");
+    newNotesKnob.setTooltip ("New Notes: share of notes swapped for in-key notes your clip doesn't use (0% = only your notes)");
+    newNotesAtt  = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (proc.params, "newnotes", newNotesKnob);
+    newNotesKnob.setTextValueSuffix ("%");
+
+    undoButton.setTooltip ("Undo: bring back the previous 10 clips (press again to redo)");
+    undoButton.onClick = [this]
+    {
+        if (proc.undoGenerate()) setStatus ("Switched back to the other batch. Press Undo again to swap.");
+        else setStatus ("Nothing to undo yet.", true);
+    };
+    addAndMakeVisible (undoButton);
 
     generateButton.setComponentID ("generate");
     generateButton.setTooltip ("Make 10 new clips. Locked lanes are kept.");
@@ -547,8 +726,8 @@ MidiCloneEditor::MidiCloneEditor (MidiCloneProcessor& p)
     }
 
     setResizable (true, true);
-    setResizeLimits (880, 660, 1700, 1200);
-    setSize (1000, 760);
+    setResizeLimits (1060, 720, 1800, 1300);
+    setSize (1180, 820);
     refreshAll();
     startTimerHz (30);
 }
@@ -590,6 +769,7 @@ void MidiCloneEditor::timerCallback()
     const int req = proc.getRequestedPreview(), act = proc.getActivePreview();
     const double pos = proc.getPlayPosition();
     for (auto& l : laneComps) l->updateState (req, act, pos);
+    source.updateState (req, act, pos);
 }
 
 void MidiCloneEditor::paint (juce::Graphics& g)
@@ -624,6 +804,8 @@ void MidiCloneEditor::paint (juce::Graphics& g)
     label (modeBox, "ENGINE");
     label (slideKnob, "SLIDE");
     label (variationKnob, "VARIATION");
+    label (newNotesKnob, "NEW NOTES");
+    label (shapeButton, "SHAPE");
 
     // Footer: how-to on the left, status on the right
     g.setFont (font (12.0f));
@@ -648,26 +830,31 @@ void MidiCloneEditor::resized()
 
     auto bar = topBar.reduced (16, 12);
     bar.removeFromLeft (190);
-    generateButton.setBounds (bar.removeFromRight (170).withSizeKeepingCentre (170, 50));
-    bar.removeFromRight (16);
+    auto right = bar.removeFromRight (230);
+    undoButton.setBounds (right.removeFromRight (68).withSizeKeepingCentre (68, 34));
+    right.removeFromRight (6);
+    generateButton.setBounds (right.withSizeKeepingCentre (right.getWidth(), 50));
+    bar.removeFromRight (12);
 
     labelsRow = bar.removeFromTop (16);
     auto controls = bar.withTrimmedTop (4);
-    auto place = [&] (juce::Component& c, int w)
+    auto place = [&] (juce::Component& c, int w, int h)
     {
-        c.setBounds (controls.removeFromLeft (w).withSizeKeepingCentre (w, 32));
-        controls.removeFromLeft (12);
+        c.setBounds (controls.removeFromLeft (w).withSizeKeepingCentre (w, h));
+        controls.removeFromLeft (10);
     };
-    const int comboW = juce::jlimit (110, 160, (controls.getWidth() - 3 * 12 - 2 * 96) / 3);
-    place (typeBox, comboW);
-    place (rhythmBox, comboW);
-    place (modeBox, comboW);
-    slideKnob.setBounds (controls.removeFromLeft (92).withSizeKeepingCentre (92, 40));
-    controls.removeFromLeft (8);
-    variationKnob.setBounds (controls.removeFromLeft (92).withSizeKeepingCentre (92, 40));
+    const int knobW = 84;
+    const int comboW = juce::jlimit (104, 150, (controls.getWidth() - 3 * knobW - 104 - 7 * 10) / 3);
+    place (typeBox, comboW, 32);
+    place (rhythmBox, comboW, 32);
+    place (modeBox, comboW, 32);
+    place (shapeButton, 104, 32);
+    place (slideKnob, knobW, 40);
+    place (variationKnob, knobW, 40);
+    place (newNotesKnob, knobW, 40);
 
     r.removeFromTop (12);
-    source.setBounds (r.removeFromTop (160));
+    source.setBounds (r.removeFromTop (196));
     r.removeFromTop (12);
     footer = r.removeFromBottom (22);
     r.removeFromBottom (6);

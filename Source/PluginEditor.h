@@ -34,12 +34,15 @@ public:
 class PianoRoll : public juce::Component
 {
 public:
-    void setNotes (std::vector<mc::Note> n, double lengthBeats, int beatsPerBar, int lowPitch, int highPitch);
+    // styles (optional, one per note): 0 normal, 1 out of key, 2 fixed, 3 fixed + repeat
+    void setNotes (std::vector<mc::Note> n, double lengthBeats, int beatsPerBar, int lowPitch, int highPitch,
+                   std::vector<int> styles = {});
     void setPlayhead (double pos01) { playhead = pos01; repaint(); }
     void setHighlighted (bool h)    { highlighted = h; repaint(); }
     void paint (juce::Graphics&) override;
 private:
     std::vector<mc::Note> notes;
+    std::vector<int> styles;
     double lengthBeats = 4.0;
     int beatsPerBar = 4, low = 36, high = 48;
     double playhead = -1.0;
@@ -61,6 +64,7 @@ class SourcePane : public juce::Component, public juce::FileDragAndDropTarget
 public:
     explicit SourcePane (MidiCloneProcessor&);
     void refresh();
+    void updateState (int requestedPreview, int activePreview, double playPos);
     void paint (juce::Graphics&) override;
     void resized() override;
     bool isInterestedInFileDrag (const juce::StringArray&) override;
@@ -70,12 +74,20 @@ public:
     std::function<void (const juce::String&)> onStatus;
 private:
     void load (const juce::File&);
+    void rebuildKeyMenu();
+    void syncKeyControls();
     MidiCloneProcessor& proc;
-    juce::TextButton browse { "Browse" };
+    juce::TextButton browse { "Browse" }, fixButton { "FIX KEY" };
+    juce::ComboBox keyBox, moveBox;
+    IconButton preview { IconButton::Kind::play };
     PianoRoll roll;
     std::unique_ptr<juce::FileChooser> chooser;
     bool dragOver = false;
-    juce::String summary;
+    juce::String summary, keyStatus;
+    bool keyStatusWarn = false;
+    int keyMenuVersion = -1;
+    std::vector<mc::Key> bestKeys;
+    juce::Rectangle<int> keyRow;
 };
 
 class LaneComponent : public juce::Component
@@ -96,6 +108,7 @@ private:
     IconButton preview { IconButton::Kind::play }, lock { IconButton::Kind::lock };
     bool empty = true, dragStarted = false;
     double overlapValue = 0.0;
+    int newNotes = 0;
 };
 
 class MidiCloneEditor : public juce::AudioProcessorEditor, private juce::Timer
@@ -113,11 +126,14 @@ private:
     MidiCloneProcessor& proc;
     NeonLook look;
 
+    juce::TooltipWindow tooltips { this, 500 };
     juce::ComboBox typeBox, rhythmBox, modeBox;
-    juce::Slider slideKnob, variationKnob;
-    juce::TextButton generateButton { "GENERATE" };
+    juce::TextButton shapeButton { "KEEP SHAPE" };
+    juce::Slider slideKnob, variationKnob, newNotesKnob;
+    juce::TextButton generateButton { "GENERATE" }, undoButton { "UNDO" };
     std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> rhythmAtt, modeAtt;
-    std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> slideAtt, variationAtt;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> shapeAtt;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> slideAtt, variationAtt, newNotesAtt;
 
     SourcePane source;
     std::vector<std::unique_ptr<LaneComponent>> laneComps;

@@ -5,6 +5,7 @@
 #include "../Source/PluginEditor.h"
 #include <iostream>
 #include <map>
+#include <set>
 
 namespace
 {
@@ -27,7 +28,7 @@ void setParam (MidiCloneProcessor& p, const char* id, float value)
     prm->setValueNotifyingHost (prm->convertTo0to1 (value));
 }
 
-void reportLanes (MidiCloneProcessor& p, const juce::File& dir, const juce::String& label)
+void reportLanes (MidiCloneProcessor& p, const juce::File& dir, const juce::String& label, bool newNotesOn = false)
 {
     dir.createDirectory();
     const auto a = p.getAnalysis();
@@ -58,8 +59,11 @@ void reportLanes (MidiCloneProcessor& p, const juce::File& dir, const juce::Stri
         auto f = p.writeLaneToTempFile (i);
         f.copyFileTo (dir.getChildFile (juce::String::formatted ("lane_%02d.mid", i + 1)));
     }
-    check (countsOk, "every lane keeps the source note percentages (within one note)");
-    check (rangeOk, "no lane goes above or below the source's notes");
+    if (! newNotesOn)
+    {
+        check (countsOk, "every lane keeps the source note percentages (within one note)");
+        check (rangeOk, "no lane goes above or below the source's notes");
+    }
     check (lengthOk, "every lane fits the source length");
     check (distinct, "all 10 lanes are different from each other");
 }
@@ -67,7 +71,7 @@ void reportLanes (MidiCloneProcessor& p, const juce::File& dir, const juce::Stri
 
 int main (int argc, char** argv)
 {
-    if (argc < 3) { std::cout << "usage: MidiCloneTest <input.mid> <outdir>\n"; return 1; }
+    if (argc < 3) { std::cout << "usage: MidiCloneTest <input.mid> <outdir> [expected_fixed.mid]\n"; return 1; }
     juce::ScopedJuceInitialiser_GUI gui;
     const juce::File in (juce::File::getCurrentWorkingDirectory().getChildFile (argv[1]));
     const juce::File out (juce::File::getCurrentWorkingDirectory().getChildFile (argv[2]));
@@ -227,6 +231,201 @@ int main (int argc, char** argv)
     reopened.setStateInformation (state.getData(), (int) state.getSize());
     check (mc::overlap (reopened.getLanes()[6].notes, proc.getLanes()[6].notes) > 0.999
            && reopened.getSourceName() == proc.getSourceName(), "lanes and source are restored when the set is reopened");
+
+    // ===================== Phase 2 =====================
+    std::cout << "\n== Key Check ==\n";
+    proc.setPreview (-1);
+    {
+        const auto v = proc.getSourceView();
+        std::cout << "  detected: " << mc::keyName (v.key) << "  (" << v.offKey << " of " << v.total << " notes out of key)";
+        const auto same = mc::sameNotesAs (v.key);
+        if (! same.empty()) std::cout << "  same notes as " << same;
+        std::cout << "\n  next best: ";
+        const auto rep = proc.getKeyReport();
+        for (size_t i = 1; i < rep.ranked.size() && i < 5; ++i)
+            std::cout << mc::keyName (rep.ranked[i].key) << " (" << rep.ranked[i].offKey << ")  ";
+        std::cout << "\n  home note: " << mc::noteNameWithOctave (proc.getAnalysis().home) << "\n";
+    }
+
+    if (argc >= 4)
+    {
+        // The user's corrected file: Fix Key must give exactly this
+        const juce::File expectedFile (juce::File::getCurrentWorkingDirectory().getChildFile (argv[3]));
+        juce::FileInputStream es (expectedFile);
+        juce::MidiFile emf;
+        emf.readFrom (es);
+        const int tpq = emf.getTimeFormat();
+        std::vector<mc::Note> expected;
+        for (int t = 0; t < emf.getNumTracks(); ++t)
+        {
+            juce::MidiMessageSequence seq (*emf.getTrack (t));
+            seq.updateMatchedPairs();
+            for (int i = 0; i < seq.getNumEvents(); ++i)
+            {
+                const auto& m = seq.getEventPointer (i)->message;
+                if (m.isNoteOn())
+                    expected.push_back ({ m.getTimeStamp() / tpq, (seq.getTimeOfMatchingKeyUp (i) - m.getTimeStamp()) / tpq,
+                                          m.getNoteNumber(), m.getVelocity() });
+            }
+        }
+        std::sort (expected.begin(), expected.end(), [] (auto& x, auto& y) { return x.start != y.start ? x.start < y.start : x.pitch < y.pitch; });
+
+        check (mc::keyName (proc.getSourceView().key) == "C Phrygian", "detects C Phrygian");
+        check (proc.getAnalysis().home % 12 == 0, "home note is C (not C#, even though C# is played more)");
+        check (proc.getAnalysis().guessedType == mc::MidiType::stab, "guesses Stab / Riff");
+        proc.setFix (true);
+        const auto v = proc.getSourceView();
+        bool same = v.notes.size() == expected.size();
+        int moved = 0;
+        for (size_t i = 0; same && i < expected.size(); ++i)
+        {
+            same = v.notes[i].pitch == expected[i].pitch && std::abs (v.notes[i].start - expected[i].start) < 1e-6
+                && std::abs (v.notes[i].length - expected[i].length) < 1e-6 && v.notes[i].velocity == expected[i].velocity;
+            moved += v.styles[i] >= 2 ? 1 : 0;
+        }
+        check (same, "Fix Key gives exactly the corrected file, note for note");
+        check (moved == 5 && v.repeats >= 1, "5 notes marked as moved, repeat marked (" + juce::String (v.repeats) + ")");
+        std::cout << "  after fix: ";
+        for (auto& sh : proc.getAnalysis().shares) std::cout << mc::noteName (sh.pitch) << " " << juce::String (sh.share * 100, 1) << "%  ";
+        std::cout << "\n";
+
+        // Stab / Riff: repeated bars stay repeated
+        proc.applyTypeDefaults (mc::MidiType::stab);
+        setParam (proc, "rhythm", 0);
+        proc.generate();
+        const auto a2 = proc.getAnalysis();
+        bool motifs = true;
+        for (auto& l : proc.getLanes())
+        {
+            auto barNotes = [&] (int b)
+            {
+                std::vector<std::pair<long, int>> out;
+                for (auto& n : l.notes)
+                    if ((int) (n.start / a2.beatsPerBar) == b) out.push_back ({ std::lround ((n.start - b * a2.beatsPerBar) * 4), n.pitch });
+                return out;
+            };
+            for (int b1 = 0; b1 < a2.bars; ++b1)
+                for (int b2 = b1 + 1; b2 < a2.bars; ++b2)
+                    if (a2.barGroup[(size_t) b1] == a2.barGroup[(size_t) b2] && barNotes (b1) != barNotes (b2)) motifs = false;
+        }
+        check (motifs, "Stab / Riff keeps repeated bars repeated (bars 1, 4, 5 and 3, 6)");
+        reportLanes (proc, out.getChildFile ("stab_fixed"), "Stab / Riff from the fixed riff");
+        bool allInKey = true;
+        const mc::Key ck { 0, 3 };
+        for (auto& l : proc.getLanes()) for (auto& n : l.notes) allInKey = allInKey && mc::inKey (n.pitch, ck);
+        check (allInKey, "every clone note is in C Phrygian");
+    }
+
+    // New Notes
+    setParam (proc, "newnotes", 20);
+    proc.generate();
+    {
+        const auto v = proc.getSourceView();
+        const auto a3 = proc.getAnalysis();
+        std::set<int> src;
+        for (auto& sh : a3.shares) src.insert (sh.pitch);
+        int newTotal = 0, all = 0;
+        bool inKeyOk = true, rangeOk = true;
+        for (auto& l : proc.getLanes())
+            for (auto& n : l.notes)
+            {
+                ++all;
+                if (src.count (n.pitch)) continue;
+                ++newTotal;
+                inKeyOk = inKeyOk && mc::inKey (n.pitch, v.target);
+                rangeOk = rangeOk && n.pitch >= a3.lowest - 2 && n.pitch <= a3.highest + 2;
+            }
+        std::cout << "\n== New Notes 20% ==\n  " << newTotal << " new of " << all << " notes ("
+                  << juce::String (100.0 * newTotal / juce::jmax (1, all), 1) << "%)\n";
+        bool allOnBeatOne = true;
+        for (auto& n : a3.notes) allOnBeatOne = allOnBeatOne && std::lround (n.start * 4) % a3.stepsPerBar == 0;
+        check (newTotal > 0 || allOnBeatOne, "New Notes adds notes the source doesn't use (beat 1 is kept)");
+        check (inKeyOk, "every new note is in " + juce::String (mc::keyName (v.target)));
+        check (rangeOk, "new notes stay within 2 semitones of the source's range");
+        reportLanes (proc, out.getChildFile ("newnotes"), "New Notes 20% (percentages include new notes)", true);
+    }
+    setParam (proc, "newnotes", 0);
+
+    // Keep Shape: compare how often clones move in the same direction as the source
+    {
+        auto shapeMatch = [&] (bool on)
+        {
+            setParam (proc, "shape", on ? 1.0f : 0.0f);
+            setParam (proc, "rhythm", 0);
+            double total = 0;
+            for (int rep = 0; rep < 3; ++rep)
+            {
+                proc.generate();
+                const auto a4 = proc.getAnalysis();
+                for (auto& l : proc.getLanes())
+                {
+                    int match = 0, cnt = 0;
+                    for (size_t i = 1; i < l.notes.size() && i < a4.notes.size(); ++i, ++cnt)
+                    {
+                        auto sg = [] (int x) { return (x > 0) - (x < 0); };
+                        match += sg (l.notes[i].pitch - l.notes[i - 1].pitch) == sg (a4.notes[i].pitch - a4.notes[i - 1].pitch) ? 1 : 0;
+                    }
+                    total += cnt ? (double) match / cnt : 0;
+                }
+            }
+            return total / (3 * mc::numLanes);
+        };
+        const double off = shapeMatch (false), on = shapeMatch (true);
+        std::cout << "\n== Keep Shape ==\n  same direction as source: off " << juce::roundToInt (off * 100) << "%, on " << juce::roundToInt (on * 100) << "%\n";
+        check (on >= off, "Keep Shape makes clones follow the source's up/down movement more");
+    }
+
+    // Undo
+    {
+        proc.generate();
+        const auto first = proc.getLanes();
+        proc.generate();
+        const auto second = proc.getLanes();
+        proc.undoGenerate();
+        const bool back = mc::overlap (proc.getLanes()[0].notes, first[0].notes) > 0.999;
+        proc.undoGenerate();
+        const bool redo = mc::overlap (proc.getLanes()[0].notes, second[0].notes) > 0.999;
+        check (back && redo, "Undo brings back the previous batch, and pressing again swaps back");
+    }
+
+    // Source preview
+    {
+        proc.setPreview (MidiCloneProcessor::sourcePreview);
+        int ons = 0;
+        for (int b = 0; b < 200; ++b)
+        {
+            ph.info.setIsPlaying (true);
+            ph.info.setPpqPosition (b * block / spb);
+            juce::MidiBuffer mb;
+            proc.processBlock (buf, mb);
+            for (const auto m : mb) ons += m.getMessage().isNoteOn() ? 1 : 0;
+        }
+        const auto srcNotes = proc.getAnalysis().notes;
+        const int expectedOns = (int) std::count_if (srcNotes.begin(), srcNotes.end(),
+                                                     [&] (const mc::Note& n) { return n.start < 200 * block / spb; });
+        check (ons >= expectedOns && ons > 0, "source preview sends the source clip (" + juce::String (ons) + " notes)");
+        proc.setPreview (-1);
+        juce::MidiBuffer mb;
+        proc.processBlock (buf, mb);
+    }
+
+    // Move To (Change Key)
+    {
+        const auto before = proc.getSourceView();
+        const int newRoot = (before.key.root + 2) % 12;
+        proc.setMoveTo (newRoot);
+        const auto v = proc.getSourceView();
+        proc.generate();
+        bool inNewKey = true;
+        for (auto& l : proc.getLanes()) for (auto& n : l.notes) inNewKey = inNewKey && mc::inKey (n.pitch, v.target);
+        const auto name = proc.writeLaneToTempFile (0).getFileName();
+        std::cout << "\n== Move To ==\n  " << mc::keyName (before.target) << " -> " << mc::keyName (v.target) << ", clip name: " << name << "\n";
+        check (v.target.root == newRoot && v.target.scale == before.key.scale, "Move To changes the home note, same scale");
+        check (inNewKey || before.offKey > 0, "clones are in the new key");
+        check (name.contains ("(" + juce::String (mc::keyName (v.target)) + ")"), "dragged clip name includes the key");
+        reportLanes (proc, out.getChildFile ("moved"), "Moved up a whole step");
+        proc.setMoveTo (-1);
+    }
 
     // 8) screenshot of the window
     proc.setPreview (2);

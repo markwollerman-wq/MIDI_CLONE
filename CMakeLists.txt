@@ -4,7 +4,7 @@ cmake_minimum_required(VERSION 3.22)
 set(CMAKE_OSX_ARCHITECTURES "arm64;x86_64" CACHE STRING "Universal binary")
 set(CMAKE_OSX_DEPLOYMENT_TARGET "10.13" CACHE STRING "Minimum macOS version")
 
-project(MidiClone VERSION 1.0.0)
+project(MidiClone VERSION 1.1.0)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -38,6 +38,7 @@ juce_add_plugin(MidiClone
 
 set(MC_SOURCES
     Source/Engine.cpp
+    Source/Keys.cpp
     Source/PluginProcessor.cpp
     Source/PluginEditor.cpp)
 

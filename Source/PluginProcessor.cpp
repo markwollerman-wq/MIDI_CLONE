@@ -36,7 +36,7 @@ juce::AudioProcessorValueTreeState::ParameterLayout MidiCloneProcessor::createLa
     using namespace juce;
     AudioProcessorValueTreeState::ParameterLayout l;
     l.add (std::make_unique<AudioParameterChoice> (ParameterID { "type", 1 }, "MIDI Type",
-                                                   StringArray { "Bass", "Melody / Lead", "Arp / Pluck" }, 0));
+                                                   StringArray { "Bass", "Melody / Lead", "Arp / Pluck", "Stab / Riff" }, 0));
     l.add (std::make_unique<AudioParameterChoice> (ParameterID { "rhythm", 1 }, "Rhythm",
                                                    StringArray { "Locked", "Same Feel" }, 0));
     l.add (std::make_unique<AudioParameterChoice> (ParameterID { "mode", 1 }, "Engine",
@@ -45,6 +45,10 @@ juce::AudioProcessorValueTreeState::ParameterLayout MidiCloneProcessor::createLa
                                                   NormalisableRange<float> (0.0f, 100.0f, 1.0f), 25.0f,
                                                   AudioParameterFloatAttributes().withLabel ("%")));
     l.add (std::make_unique<AudioParameterInt> (ParameterID { "variation", 1 }, "Variation", 1, 10, 5));
+    l.add (std::make_unique<AudioParameterBool> (ParameterID { "shape", 1 }, "Keep Shape", false));
+    l.add (std::make_unique<AudioParameterFloat> (ParameterID { "newnotes", 1 }, "New Notes",
+                                                  NormalisableRange<float> (0.0f, 30.0f, 1.0f), 0.0f,
+                                                  AudioParameterFloatAttributes().withLabel ("%")));
     return l;
 }
 
@@ -75,10 +79,10 @@ void MidiCloneProcessor::allNotesOff (int sample, std::vector<std::pair<int, juc
 void MidiCloneProcessor::renderRange (int laneIndex, double a, double b, double blockStartPpq, double samplesPerBeat,
                                       int numSamples, std::vector<std::pair<int, juce::MidiMessage>>& out)
 {
-    if (laneIndex < 0 || laneIndex >= mc::numLanes || b <= a) return;
-    const auto& lane = lanes[(size_t) laneIndex];
+    if (laneIndex < 0 || laneIndex > sourcePreview || b <= a) return;
+    const auto& notes = laneIndex == sourcePreview ? previewNotes : lanes[(size_t) laneIndex].notes;
     const double L = analysis.lengthBeats;
-    if (lane.empty || L <= 0.0) return;
+    if (notes.empty() || L <= 0.0) return;
 
     auto toSample = [&] (double ppq)
     { return juce::jlimit (0, numSamples - 1, (int) ((ppq - blockStartPpq) * samplesPerBeat)); };
@@ -87,7 +91,7 @@ void MidiCloneProcessor::renderRange (int laneIndex, double a, double b, double 
     const long kLast  = (long) std::floor (b / L);
     for (long k = kFirst; k <= kLast; ++k)
     {
-        for (auto& n : lane.notes)
+        for (auto& n : notes)
         {
             const double on = (double) k * L + n.start;
             const double off = on + n.length;
@@ -256,38 +260,137 @@ juce::String MidiCloneProcessor::loadMidiFile (const juce::File& file)
         }
     }
 
-    auto a = mc::analyse (notes, beatsPerBar);
-    if (! a.valid) return juce::String (a.problem);
+    auto check = mc::analyse (notes, beatsPerBar);
+    if (! check.valid) return juce::String (check.problem);
+
+    std::sort (notes.begin(), notes.end(), [] (const mc::Note& x, const mc::Note& y)
+               { return x.start < y.start - 1e-9 || (std::abs (x.start - y.start) <= 1e-9 && x.pitch < y.pitch); });
+    auto report = mc::detectKey (notes, beatsPerBar);
 
     {
         const juce::SpinLock::ScopedLockType lock (dataLock);
-        sourceNotes = notes;
+        rawNotes = notes;
         sourceBeatsPerBar = beatsPerBar;
-        analysis = a;
-        lanes = {};
         sourceName = file.getFileName();
+        keyReport = report;
+        keyAuto = true;
+        fixOn = false;
+        moveTo = -1;
+        lanes = {};
+        hasPrevious = false;
     }
+    rebuild();
+    ++keyVersion;
     requestedPreview = -1;
     flushNotes = true;
 
-    // Pick the guessed type and its rhythm default (the user can change both)
-    if (auto* p = params.getParameter ("type"))
-        p->setValueNotifyingHost (p->convertTo0to1 ((float) (int) a.guessedType));
-    if (auto* p = params.getParameter ("rhythm"))
-        p->setValueNotifyingHost (p->convertTo0to1 ((float) (int) mc::defaultRhythmFor (a.guessedType)));
-
+    applyTypeDefaults (getAnalysis().guessedType);   // the user can change the type afterwards
     ++changeCounter;
     return {};
+}
+
+void MidiCloneProcessor::rebuild()
+{
+    std::vector<mc::Note> raw;
+    int bpb = 4;
+    mc::KeyReport report;
+    mc::Key key;
+    bool fix = false, autoKey = true;
+    int move = -1;
+    {
+        const juce::SpinLock::ScopedLockType lock (dataLock);
+        raw = rawNotes;
+        bpb = sourceBeatsPerBar;
+        report = keyReport;
+        key = chosenKey;
+        fix = fixOn;
+        autoKey = keyAuto;
+        move = moveTo;
+    }
+    if (raw.empty()) return;
+
+    if (autoKey) key = report.ranked.empty() ? mc::Key {} : report.ranked.front().key;
+
+    const auto fr = mc::fixToKey (raw, key);
+    auto working = fix ? fr.notes : raw;
+
+    // Move To: shift to the new root by the smallest step (-6..+5 semitones) so the register stays close
+    int shift = 0;
+    if (move >= 0 && key.valid())
+    {
+        shift = ((move - key.root) % 12 + 12) % 12;
+        if (shift > 5) shift -= 12;
+    }
+    for (auto& n : working) n.pitch = juce::jlimit (0, 127, n.pitch + shift);
+    const mc::Key target { key.valid() ? ((key.root + shift) % 12 + 12) % 12 : 0, key.scale };
+
+    auto a = mc::analyse (working, bpb, key.valid() && key.scale != mc::chromaticScaleIndex() ? target.root : -1);
+
+    SourceView v;
+    v.lengthBeats = a.lengthBeats;
+    v.beatsPerBar = a.beatsPerBar;
+    v.total = (int) raw.size();
+    v.offKey = (int) fr.offKey.size();
+    v.repeats = (int) fr.repeats.size();
+    v.fixOn = fix;
+    v.keyAuto = autoKey;
+    v.key = key;
+    v.target = target;
+    v.moveTo = move;
+    v.low = 127; v.high = 0;
+    std::vector<mc::Note> preview;
+    for (size_t i = 0; i < working.size(); ++i)
+    {
+        auto n = working[i];
+        n.start -= a.offsetBeats;
+        const bool off = std::find (fr.offKey.begin(), fr.offKey.end(), (int) i) != fr.offKey.end();
+        const bool rep = std::find (fr.repeats.begin(), fr.repeats.end(), (int) i) != fr.repeats.end();
+        v.notes.push_back (n);
+        v.styles.push_back (fix ? (off ? (rep ? 3 : 2) : 0) : (off ? 1 : 0));
+        v.low = juce::jmin (v.low, n.pitch);
+        v.high = juce::jmax (v.high, n.pitch);
+        if (n.start >= -1e-9 && n.start < a.lengthBeats) preview.push_back (n);
+    }
+
+    {
+        const juce::SpinLock::ScopedLockType lock (dataLock);
+        analysis = a;
+        view = v;
+        previewNotes = preview;
+        targetKey = target;
+        if (autoKey) chosenKey = key;
+    }
+    flushNotes = true;
+    ++changeCounter;
+}
+
+void MidiCloneProcessor::setParam (const char* id, float value)
+{
+    if (auto* p = params.getParameter (id))
+        p->setValueNotifyingHost (p->convertTo0to1 (value));
+}
+
+void MidiCloneProcessor::applyTypeDefaults (mc::MidiType t)
+{
+    setParam ("type", (float) (int) t);
+    setParam ("rhythm", (float) (int) mc::defaultRhythmFor (t));
+    setParam ("shape", mc::defaultKeepShapeFor (t) ? 1.0f : 0.0f);
+    if (t == mc::MidiType::stab) setParam ("mode", 0.0f);   // stabs: Grid Snapped
 }
 
 mc::Settings MidiCloneProcessor::currentSettings() const
 {
     mc::Settings s;
-    s.type        = (mc::MidiType) (int) params.getRawParameterValue ("type")->load();
+    s.type        = (mc::MidiType) juce::jlimit (0, 3, (int) params.getRawParameterValue ("type")->load());
     s.rhythm      = (mc::RhythmMode) (int) params.getRawParameterValue ("rhythm")->load();
     s.slide       = params.getRawParameterValue ("mode")->load() > 0.5f;
     s.slideAmount = params.getRawParameterValue ("slide")->load() / 100.0f;
     s.variation   = juce::jlimit (1, 10, (int) params.getRawParameterValue ("variation")->load());
+    s.keepShape   = params.getRawParameterValue ("shape")->load() > 0.5f;
+    s.newNotes    = params.getRawParameterValue ("newnotes")->load() / 100.0f;
+    const juce::SpinLock::ScopedLockType lock (dataLock);
+    s.keyRoot  = targetKey.root;
+    s.keyScale = targetKey.scale;
     return s;
 }
 
@@ -301,16 +404,86 @@ void MidiCloneProcessor::generate()
         a = analysis;
         working = lanes;
     }
+    const auto before = working;
 
     mc::generate (a, currentSettings(), working,
                   (std::uint32_t) juce::Random::getSystemRandom().nextInt());
 
     {
         const juce::SpinLock::ScopedLockType lock (dataLock);
+        previousLanes = before;
+        hasPrevious = true;
         lanes = working;
     }
     flushNotes = true;   // the previewing lane may have new notes
     ++changeCounter;
+}
+
+bool MidiCloneProcessor::undoGenerate()
+{
+    {
+        const juce::SpinLock::ScopedLockType lock (dataLock);
+        if (! hasPrevious) return false;
+        std::swap (lanes, previousLanes);
+    }
+    flushNotes = true;
+    ++changeCounter;
+    return true;
+}
+
+bool MidiCloneProcessor::canUndo() const
+{
+    const juce::SpinLock::ScopedLockType lock (dataLock);
+    return hasPrevious;
+}
+
+MidiCloneProcessor::SourceView MidiCloneProcessor::getSourceView() const
+{
+    const juce::SpinLock::ScopedLockType lock (dataLock);
+    return view;
+}
+
+mc::KeyReport MidiCloneProcessor::getKeyReport() const
+{
+    const juce::SpinLock::ScopedLockType lock (dataLock);
+    return keyReport;
+}
+
+void MidiCloneProcessor::setKey (mc::Key k)
+{
+    {
+        const juce::SpinLock::ScopedLockType lock (dataLock);
+        chosenKey = k;
+        keyAuto = false;
+    }
+    rebuild();
+}
+
+void MidiCloneProcessor::setAutoKey()
+{
+    {
+        const juce::SpinLock::ScopedLockType lock (dataLock);
+        keyAuto = true;
+    }
+    rebuild();
+}
+
+void MidiCloneProcessor::setFix (bool on)
+{
+    {
+        const juce::SpinLock::ScopedLockType lock (dataLock);
+        fixOn = on;
+    }
+    rebuild();
+}
+
+void MidiCloneProcessor::setMoveTo (int root)
+{
+    {
+        const juce::SpinLock::ScopedLockType lock (dataLock);
+        moveTo = (root >= 0 && root < 12) ? root : -1;
+    }
+    rebuild();
 }
 
 void MidiCloneProcessor::setLocked (int lane, bool locked)
@@ -323,7 +496,7 @@ void MidiCloneProcessor::setLocked (int lane, bool locked)
 
 void MidiCloneProcessor::setPreview (int lane)
 {
-    requestedPreview = (lane >= 0 && lane < mc::numLanes) ? lane : -1;
+    requestedPreview = (lane >= 0 && lane <= sourcePreview) ? lane : -1;
     ++changeCounter;
 }
 
@@ -356,18 +529,22 @@ juce::File MidiCloneProcessor::writeLaneToTempFile (int laneIndex) const
     mc::Lane lane;
     mc::Analysis a;
     juce::String base;
+    mc::Key key;
     {
         const juce::SpinLock::ScopedLockType lock (dataLock);
         if (laneIndex < 0 || laneIndex >= mc::numLanes) return {};
         lane = lanes[(size_t) laneIndex];
         a = analysis;
-        base = juce::File (sourceName).getFileNameWithoutExtension();
+        key = targetKey;
+        base = sourceName.containsChar ('.') ? sourceName.upToLastOccurrenceOf (".", false, false) : sourceName;
     }
     if (lane.empty) return {};
     if (base.isEmpty()) base = "MIDI";
 
     const int tpq = 960;
-    const juce::String clipName = base + " Clone " + juce::String (laneIndex + 1);
+    juce::String clipName = base + " Clone " + juce::String (laneIndex + 1);
+    if (key.valid() && key.scale != mc::chromaticScaleIndex())
+        clipName += " (" + juce::String (mc::keyName (key)) + ")";
     juce::MidiMessageSequence seq;
     seq.addEvent (juce::MidiMessage::textMetaEvent (3, clipName), 0.0);
     seq.addEvent (juce::MidiMessage::timeSignatureMetaEvent (a.beatsPerBar, 4), 0.0);
@@ -406,8 +583,16 @@ void MidiCloneProcessor::getStateInformation (juce::MemoryBlock& destData)
         juce::ValueTree src ("Source");
         src.setProperty ("name", sourceName, nullptr);
         src.setProperty ("beatsPerBar", sourceBeatsPerBar, nullptr);
-        src.setProperty ("notes", notesToString (sourceNotes), nullptr);
+        src.setProperty ("notes", notesToString (rawNotes), nullptr);
         root.appendChild (src, nullptr);
+
+        juce::ValueTree k ("Key");
+        k.setProperty ("auto", keyAuto, nullptr);
+        k.setProperty ("root", chosenKey.root, nullptr);
+        k.setProperty ("scale", chosenKey.scale, nullptr);
+        k.setProperty ("fix", fixOn, nullptr);
+        k.setProperty ("moveTo", moveTo, nullptr);
+        root.appendChild (k, nullptr);
 
         juce::ValueTree ls ("Lanes");
         for (auto& lane : lanes)
@@ -415,6 +600,7 @@ void MidiCloneProcessor::getStateInformation (juce::MemoryBlock& destData)
             juce::ValueTree l ("Lane");
             l.setProperty ("locked", lane.locked, nullptr);
             l.setProperty ("overlap", lane.overlapWithSource, nullptr);
+            l.setProperty ("newNotes", lane.newNoteCount, nullptr);
             l.setProperty ("notes", notesToString (lane.notes), nullptr);
             ls.appendChild (l, nullptr);
         }
@@ -437,7 +623,7 @@ void MidiCloneProcessor::setStateInformation (const void* data, int sizeInBytes)
     auto src = root.getChildWithName ("Source");
     auto notes = notesFromString (src.getProperty ("notes").toString());
     const int bpb = (int) src.getProperty ("beatsPerBar", 4);
-    auto a = mc::analyse (notes, bpb);
+    auto k = root.getChildWithName ("Key");
 
     mc::LaneSet restored;
     auto ls = root.getChildWithName ("Lanes");
@@ -448,17 +634,27 @@ void MidiCloneProcessor::setStateInformation (const void* data, int sizeInBytes)
         lane.notes = notesFromString (l.getProperty ("notes").toString());
         lane.locked = (bool) l.getProperty ("locked", false);
         lane.overlapWithSource = (double) l.getProperty ("overlap", 0.0);
+        lane.newNoteCount = (int) l.getProperty ("newNotes", 0);
         lane.empty = lane.notes.empty();
     }
 
     {
         const juce::SpinLock::ScopedLockType lock (dataLock);
-        sourceNotes = notes;
+        rawNotes = notes;
         sourceBeatsPerBar = bpb;
-        analysis = a;
         sourceName = src.getProperty ("name").toString();
+        keyReport = mc::detectKey (notes, bpb);
+        keyAuto = (bool) k.getProperty ("auto", true);
+        chosenKey = { (int) k.getProperty ("root", 0), (int) k.getProperty ("scale", -1) };
+        if (chosenKey.scale >= (int) mc::scales().size()) keyAuto = true;
+        fixOn = (bool) k.getProperty ("fix", false);
+        moveTo = (int) k.getProperty ("moveTo", -1);
         lanes = restored;
+        hasPrevious = false;
+        analysis = {};
     }
+    if (! notes.empty()) rebuild();
+    ++keyVersion;
     requestedPreview = -1;
     ++changeCounter;
 }
